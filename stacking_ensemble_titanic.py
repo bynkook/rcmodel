@@ -5,12 +5,14 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.model_selection import train_test_split, cross_val_predict
+from sklearn.model_selection import train_test_split, cross_val_predict, StratifiedKFold, cross_val_predict
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, ExtraTreesClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, classification_report
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, classification_report, RocCurveDisplay, roc_curve, auc, roc_auc_score
+from sklearn.preprocessing import LabelEncoder, StandardScaler, label_binarize
 from sklearn.base import BaseEstimator, ClassifierMixin
+from itertools import cycle
+import shap
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -339,6 +341,181 @@ def analyze_feature_importance(model, X, feature_names):
         print("해당 모델은 feature_importances_ 속성을 지원하지 않습니다.")
         return None
 
+# ROC, AUC
+def plot_roc_auc(model, X, y, class_names=None, title='ROC Curve', savepath=None):
+    """
+    Binary/Multiclass ROC curve and AUC.
+    Parameters
+    ----------
+    model : fitted estimator with predict_proba or decision_function
+    X : array-like, shape (n_samples, n_features)
+    y : array-like, shape (n_samples,)
+    class_names : list[str] | None
+    title : str
+    savepath : str | None
+    Returns
+    -------
+    dict : {'micro': auc or None, <class_name>: auc, ...}
+    """
+    y = np.asarray(y)
+    classes = np.unique(y)
+    n_classes = len(classes)
+    if class_names is None:
+        class_names = [str(c) for c in classes]
+
+    # score matrix
+    if hasattr(model, "predict_proba"):
+        scores = model.predict_proba(X)
+        if n_classes == 2:
+            # ensure shape (n_samples,)
+            scores = scores[:, 1] if scores.ndim == 2 else scores.ravel()
+    elif hasattr(model, "decision_function"):
+        scores = model.decision_function(X)
+        if n_classes == 2 and scores.ndim > 1:
+            scores = scores.ravel()
+    else:
+        raise ValueError("Estimator must implement predict_proba or decision_function.")
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    auc_map = {}
+    if n_classes == 2:
+        fpr, tpr, _ = roc_curve(y, scores, pos_label=classes[1])
+        roc_auc = auc(fpr, tpr)
+        auc_map[class_names[1]] = roc_auc
+        ax.plot(fpr, tpr, label=f"AUC = {roc_auc:.4f}")
+        ax.plot([0, 1], [0, 1], linestyle="--")
+        ax.set_xlabel("False Positive Rate")
+        ax.set_ylabel("True Positive Rate")
+        ax.set_title(title)
+        ax.legend(loc="lower right")
+    else:
+        y_bin = label_binarize(y, classes=classes)
+        if scores.ndim == 1:
+            raise ValueError("For multiclass ROC, score must be 2D with class probabilities or decision scores.")
+        fpr, tpr = {}, {}
+        for i, cname in enumerate(class_names):
+            fpr[i], tpr[i], _ = roc_curve(y_bin[:, i], scores[:, i])
+            auc_i = auc(fpr[i], tpr[i])
+            auc_map[cname] = auc_i
+            ax.plot(fpr[i], tpr[i], label=f"{cname} AUC = {auc_i:.4f}")
+        fpr["micro"], tpr["micro"], _ = roc_curve(y_bin.ravel(), scores.ravel())
+        auc_micro = auc(fpr["micro"], tpr["micro"])
+        auc_map["micro"] = auc_micro
+        ax.plot(fpr["micro"], tpr["micro"], label=f"micro-average AUC = {auc_micro:.4f}")
+        ax.plot([0, 1], [0, 1], linestyle="--")
+        ax.set_xlabel("False Positive Rate")
+        ax.set_ylabel("True Positive Rate")
+        ax.set_title(title)
+        ax.legend(loc="lower right")
+    # ensure nothing is clipped on the canvas
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    fig.tight_layout()  # adjust paddings
+    if savepath:
+        fig.savefig(savepath, bbox_inches="tight", dpi=150)
+    plt.show()
+    return auc_map
+
+# SHAP 분석
+def analyze_feature_importance_shap(model, X, feature_names=None, class_idx=None, max_display=20, title_prefix="SHAP", savepath_prefix=None):
+    """
+    SHAP analysis and plotting without touching existing analyze_feature_importance().
+    Parameters
+    ----------
+    model : fitted estimator
+    X : pandas.DataFrame or np.ndarray
+    feature_names : list[str] | None
+    class_idx : int | None  # for classification, which class to visualize
+    max_display : int
+    title_prefix : str
+    savepath_prefix : str | None  # if given, save figures as f"{savepath_prefix}_beeswarm.png" and f"{savepath_prefix}_bar.png"
+    Returns
+    -------
+    shap_values : shap.Explanation or np.ndarray (implementation-dependent)
+    """
+    if shap is None:
+        raise ImportError("shap is not installed. Please `pip install shap`.")
+
+    # Prepare data and names
+    if hasattr(X, "values") and hasattr(X, "columns"):
+        data = X
+        if feature_names is None:
+            feature_names = list(X.columns)
+    else:
+        data = np.asarray(X)
+        if feature_names is None:
+            feature_names = [f"f{i}" for i in range(data.shape[1])]
+
+    # Prefer TreeExplainer when possible, else fallback
+    try:
+        explainer = shap.TreeExplainer(model)
+    except Exception:
+        explainer = shap.Explainer(model)
+
+    sv = explainer(data)
+
+    # Select class for multi-output classification if needed
+    # Newer SHAP returns Explanation with potentially 3D values; slice to 2D.
+    try:
+        values = sv.values
+    except Exception:
+        values = np.asarray(sv)
+
+    selected = sv
+    try:
+        if values.ndim == 3:
+            k = class_idx if class_idx is not None else (1 if values.shape[2] > 1 else 0)
+            base_vals = getattr(sv, "base_values", None)
+            base_vals_k = base_vals[:, k] if isinstance(base_vals, np.ndarray) and base_vals.ndim == 2 else base_vals
+            selected = shap.Explanation(
+                values=values[:, :, k],
+                base_values=base_vals_k,
+                data=getattr(sv, "data", data),
+                feature_names=feature_names,
+            )
+    except Exception:
+        # Fall back silently; plots below will attempt with `sv` as-is.
+        selected = sv
+
+    # Beeswarm plot
+    try:
+        shap.plots.beeswarm(selected, max_display=max_display, show=False)
+    except Exception:
+        shap.summary_plot(getattr(selected, "values", selected), data, feature_names=feature_names, show=False, max_display=max_display)
+    if title_prefix:
+        plt.gcf().suptitle(f"{title_prefix} - beeswarm", y=0.98)
+    plt.tight_layout(rect=(0, 0, 1, 0.96))
+    if savepath_prefix:
+        plt.savefig(f"{savepath_prefix}_beeswarm.png", bbox_inches="tight", dpi=150)
+    plt.show()
+
+    # Bar plot (mean |SHAP|)
+    try:
+        shap.plots.bar(selected, max_display=max_display, show=False)
+        if title_prefix:
+            plt.gcf().suptitle(f"{title_prefix} - bar", y=0.98)
+        plt.tight_layout(rect=(0, 0, 1, 0.96))
+        if savepath_prefix:
+            plt.savefig(f"{savepath_prefix}_bar.png", bbox_inches="tight", dpi=150)
+        plt.show()
+    except Exception:
+        # Manual bar as fallback
+        vals = getattr(selected, "values", selected)
+        if hasattr(vals, "shape") and vals.ndim == 2:
+            mean_abs = np.abs(vals).mean(axis=0)
+            order = np.argsort(mean_abs)[::-1][:max_display]
+            fig = plt.figure(figsize=(8, 5))
+            plt.bar(range(len(order)), mean_abs[order])
+            plt.xticks(range(len(order)), [feature_names[i] for i in order], rotation=60, ha="right")
+            plt.ylabel("mean(|SHAP value|)")
+            plt.title(f"{title_prefix} - bar")
+            fig.tight_layout()
+            if savepath_prefix:
+                plt.savefig(f"{savepath_prefix}_bar.png", bbox_inches="tight", dpi=150)
+            plt.show()
+    return sv
+
+
 # ============================================================================
 # 8. 결과 저장
 # ============================================================================
@@ -432,6 +609,76 @@ def main():
     # 8. 특성 중요도 분석
     print("\n" + "="*50)
     importance_df = analyze_feature_importance(direct_classifier, X, feature_columns)
+
+    # === ROC/AUC & SHAP analysis ===    
+    FINAL_MODEL_VAR = stacked_classifier
+    # 1) locate fitted model variable
+    frame = {**globals(), **locals()}
+    model = None
+    # 1-1) explicit preferred name
+    if isinstance(FINAL_MODEL_VAR, str) and FINAL_MODEL_VAR:
+        m = frame.get(FINAL_MODEL_VAR)
+        if m is not None:
+            model = m
+    # 1-2) fallback: common names
+    if model is None:
+        for _name in ["model", "clf", "final_model", "best_model",
+                      "stack_clf", "stacking_clf", "stacking_model",
+                      "estimator", "pipe", "pipeline"]:
+            m = frame.get(_name)
+            if m is not None:
+                model = m
+                break
+    # 1-3) last resort: scan any estimator-like fitted object
+    if model is None:
+        # pick first object that looks fitted: has predict and n_features_in_/classes_
+        for name, obj in frame.items():
+            if hasattr(obj, "predict") and hasattr(obj, "fit"):
+                if any(hasattr(obj, attr) for attr in ("n_features_in_", "classes_", "feature_names_in_")):
+                    model = obj
+                    break
+    if model is None:
+        cand = [n for n, o in frame.items() if hasattr(o, "predict") and hasattr(o, "fit")]
+        raise RuntimeError(f"Fitted model not found. Set FINAL_MODEL_VAR to one of: {cand}")
+
+    # 2) choose evaluation split without NameError by probing availability
+    frame = {**globals(), **locals()}
+    candidates = [
+        ("X_test", "y_test"),
+        ("X_valid", "y_valid"),
+        ("X_val", "y_val"),
+        ("X_eval", "y_eval"),
+        ("X_train", "y_train"),
+        ("X", "y"),
+    ]
+    for xn, yn in candidates:
+        if xn in frame and yn in frame:
+            X_eval, y_eval = frame[xn], frame[yn]
+            break
+    else:
+        raise RuntimeError(
+            "No evaluation split found. Define one of: "
+            "(X_test,y_test) | (X_valid,y_valid) | (X_val,y_val) | (X_train,y_train) | (X,y)."
+        )
+
+    # 3) ROC/AUC
+    class_names = getattr(model, "classes_", None)
+    auc_map = plot_roc_auc(model, X_eval, y_eval, class_names=class_names, title="ROC Curve (eval)")
+    print("[AUC]", {k: round(v, 6) for k, v in auc_map.items()})
+
+    # 4) SHAP (optional if shap installed)
+    feature_names = list(X_eval.columns) if hasattr(X_eval, "columns") else None
+    try:
+        _ = analyze_feature_importance_shap(
+            model,
+            X_eval,
+            feature_names=feature_names,
+            title_prefix="SHAP (eval)"
+        )
+    except ImportError:
+        print("SHAP not available. Install with: pip install shap")
+    except Exception as e:
+        print(f"SHAP analysis failed: {e}")
     
     # 9. 결과 저장
     save_results(y_test, y_pred_direct, y_pred_stacked, importance_df, direct_accuracy, stacked_accuracy)
