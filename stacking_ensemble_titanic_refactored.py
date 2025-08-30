@@ -72,7 +72,7 @@ from sklearn.metrics import (
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, ExtraTreesClassifier
 from sklearn.linear_model import LogisticRegression
 
 import matplotlib
@@ -287,10 +287,9 @@ class StackedEnsembleClassifier(BaseEstimator, ClassifierMixin):
     def __post_init__(self):
         if self.base_clfs is None:
             self.base_clfs = [
-                RandomForestClassifier(n_estimators=200, max_depth=None, random_state=self.random_state),
-                RandomForestClassifier(n_estimators=400, max_depth=8, random_state=self.random_state),
-                RandomForestClassifier(n_estimators=300, max_depth=12, random_state=self.random_state),
-                RandomForestClassifier(n_estimators=100, max_depth=6, random_state=self.random_state),
+                RandomForestClassifier(n_estimators=100, random_state=self.random_state),
+                GradientBoostingClassifier(n_estimators=100, random_state=self.random_state),
+                ExtraTreesClassifier(n_estimators=50, random_state=self.random_state),
             ]
         if self.meta_clf is None:
             self.meta_clf = LogisticRegression(max_iter=200, multi_class="auto", n_jobs=None)
