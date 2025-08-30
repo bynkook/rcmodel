@@ -41,7 +41,6 @@ TIMEOUT_SEC = None
 N_JOBS = -1
 
 # TODO : 단면 형상('shape') cat_cols 에 추가 예정
-# 2025.08.26    findex, agindex, rho 추가
 # COL_FEAT = ['f_idx', 'width', 'height', 'Ag_idx', 'd', 'Sm', 'as_provided', 'rho', 'phi_mn']  # 필요한 항목만 학습 대상으로 선택
 COL_FEAT = ['f_idx', 'width', 'height', 'Sm', 'bd', 'rho', 'phi_mn']  # 필요한 항목만 학습 대상으로 선택
 # COL_TGTS = ['d', 'Sm', 'as_provided', 'phi_mn']     # phi_mn 을 target 에 추가함(Mu > phi_Mn 검토용) 2025.08.24
