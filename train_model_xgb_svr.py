@@ -1,8 +1,7 @@
 # train_model_xgb.py — XGB + SVR 동시 학습/평가/저장
-# rho, fidx, Agidx 신규 생성
-# fidx = 27400 / 1e5 = 2.74
-# Agidx = 8001000 / 1e5 = 80.01
-# rho = as_providec / (width * d) * 100
+# f_idx, rho, 신규 생성
+# f_idx = 27400 / 1e3 = 27.4
+# rho = as_provided / (width * d) 
 # best_(model)_params_by_target 을 bundle 에 추가함
 
 import time
