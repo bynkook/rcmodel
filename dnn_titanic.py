@@ -6,9 +6,9 @@ import tensorflow as tf
 import random
 import re  # For title extraction
 
-random.seed(0)
-np.random.seed(0)
-tf.random.set_seed(0)
+random.seed(42)
+np.random.seed(42)
+tf.random.set_seed(42)
 
 ### Load Data
 df = pd.read_csv("./titanic.csv")
@@ -139,16 +139,26 @@ X_train = scaler.fit_transform(X_train)
 X_test = scaler.transform(X_test)
 
 ### Build DNN Model
-model = tf.keras.Sequential([
-    tf.keras.layers.Dense(32, activation='relu', input_shape=(X_train.shape[1],)),
-    tf.keras.layers.Dense(16, activation='relu'),
-    tf.keras.layers.Dropout(rate=0.2),
-    tf.keras.layers.Dense(16, activation='relu'),
-    tf.keras.layers.Dropout(rate=0.2),
-    tf.keras.layers.Dense(8, activation='relu'),
-    tf.keras.layers.Dropout(rate=0.2),
-    tf.keras.layers.Dense(1, activation='sigmoid')
-])
+from tensorflow.python.keras.models import Sequential
+from tensorflow.python.keras.layers import Dense, Dropout
+from tensorflow.python.keras import Input    # 시험에서는 안씀.
+
+# 모델 생성
+model = Sequential()
+
+# 모델 구성
+model.add(Input(X_train.shape[1],))    # Warning 메시지 제거
+model.add(Dense(32, activation='relu'))
+# AICE 시험에서는
+# - model.add(Input(X_train.shape[1],))
+# + model.add(Dense(32, activation='relu', input_shape(X_train.shape[1],)))
+model.add(Dense(16, activation='relu'))
+model.add(Dropout(rate=0.2))
+model.add(Dense(16, activation='relu'))
+model.add(Dropout(rate=0.2))
+model.add(Dense(8, activation='relu'))
+model.add(Dropout(rate=0.2))
+model.add(Dense(1, activation='sigmoid'))  # 이진 분류 문제
 
 # Model summary
 model.summary()
@@ -172,8 +182,7 @@ model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy']
 # precision, recall, f1_score: 클래스 불균형이나 특정 클래스(양성)에 초점을 맞출 때 유용
 # auc: 클래스 분리 능력을 평가
 
-
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint # type: ignore
+from tensorflow.python.keras.callbacks import EarlyStopping, ModelCheckpoint
 
 es = EarlyStopping(monitor='val_loss', patience=5, verbose=1)
 mc = ModelCheckpoint('best_model.h5', monitor='val_loss', save_best_only=True, verbose=1)
@@ -250,17 +259,19 @@ print("SMOTE applied after train/test dataset", X_train_ovr.shape, y_train_ovr.s
 # SMOTE after label values distribution
 print(pd.Series(y_train_ovr).value_counts())
 
-# Build DNN model (consistent with sigmoid/binary)
-model_smote = tf.keras.Sequential([
-    tf.keras.layers.Dense(64, activation='relu', input_shape=(X_train_ovr.shape[1],)),
-    tf.keras.layers.Dense(32, activation='relu'),
-    tf.keras.layers.Dropout(rate=0.2),
-    tf.keras.layers.Dense(16, activation='relu'),
-    tf.keras.layers.Dropout(rate=0.2),
-    tf.keras.layers.Dense(8, activation='relu'),
-    tf.keras.layers.Dropout(rate=0.2),
-    tf.keras.layers.Dense(1, activation='sigmoid')
-])
+# 모델 생성
+model_smote = Sequential()
+
+# 모델 구성
+model_smote.add(Input(X_train.shape[1],))
+model_smote.add(Dense(32, activation='relu'))
+model_smote.add(Dense(16, activation='relu'))
+model_smote.add(Dropout(rate=0.2))
+model_smote.add(Dense(16, activation='relu'))
+model_smote.add(Dropout(rate=0.2))
+model_smote.add(Dense(8, activation='relu'))
+model_smote.add(Dropout(rate=0.2))
+model_smote.add(Dense(1, activation='sigmoid'))  # 이진 분류 문제
 
 # Compile
 model_smote.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
