@@ -173,7 +173,7 @@ model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy']
 # auc: 클래스 분리 능력을 평가
 
 
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint # type: ignore
 
 es = EarlyStopping(monitor='val_loss', patience=5, verbose=1)
 mc = ModelCheckpoint('best_model.h5', monitor='val_loss', save_best_only=True, verbose=1)
