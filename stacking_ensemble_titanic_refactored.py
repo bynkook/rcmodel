@@ -571,50 +571,63 @@ def print_result(
     file_path: Optional[str] = "output/results.txt",
 ) -> None:
     """
-    Centralized text-only printing of classification analysis results:
-    - Accuracies & absolute improvement
-    - Confusion matrices (direct vs stacked)
-    - Classification reports (precision/recall/F1/support; micro/macro/weighted)
-    Also writes the same content to `file_path` if provided.
+    Text-only 결과 출력(간소화 버전):
+    - Accuracy 및 개선폭
+    - Confusion Matrix (Direct / Stacked)  ← sklearn.metrics.confusion_matrix 사용
+    - Classification Report (precision/recall/f1)
+    화면에 출력하고, 같은 내용을 file_path에도 append 저장.
     """
+    os.makedirs("output", exist_ok=True)
+
+    # 라벨 순서 고정(보고서/행열 순서 일치)
+    labels = np.unique(y_true)
+    if class_names and len(class_names) == len(labels):
+        label_names = list(class_names)
+    else:
+        label_names = [str(c) for c in labels]
+
+    # --- Confusion Matrices (간단하게) ---
+    cm_direct = confusion_matrix(y_true, y_pred_direct, labels=labels)
+    cm_stacked = confusion_matrix(y_true, y_pred_stacked, labels=labels)
+
+    df_cm_direct = pd.DataFrame(cm_direct, index=label_names, columns=label_names)
+    df_cm_stacked = pd.DataFrame(cm_stacked, index=label_names, columns=label_names)
+
+    # --- Classification Reports ---
+    cr_direct = classification_report(y_true, y_pred_direct,
+                                      target_names=label_names if len(label_names) == len(np.unique(y_true)) else None,
+                                      digits=4)
+    cr_stacked = classification_report(y_true, y_pred_stacked,
+                                       target_names=label_names if len(label_names) == len(np.unique(y_true)) else None,
+                                       digits=4)
+
+    # --- Assemble text once ---
     lines = []
     lines.append("========== MODEL PERFORMANCE (TEST) ==========")
     lines.append(f"Direct Accuracy : {direct_accuracy:.6f}")
     lines.append(f"Stacked Accuracy: {stacked_accuracy:.6f}")
-    lines.append(f"Absolute Improvement: {stacked_accuracy - direct_accuracy:+.6f}")
+    lines.append(f"Absolute Improvement: {stacked_accuracy - direct_accuracy:+.6f}\n")
+
+    lines.append("----- Confusion Matrix (Direct) -----")
+    lines.append(df_cm_direct.to_string())
     lines.append("")
 
-    # Confusion matrices
-    cm_direct = confusion_matrix(y_true, y_pred_direct)
-    cm_stacked = confusion_matrix(y_true, y_pred_stacked)
-
-    def _cm_to_str(cm: np.ndarray, title: str) -> List[str]:
-        hdr = [title]
-        hdr.append(f"shape={cm.shape}")
-        # Optional header with class labels if provided
-        if class_names and len(class_names) == cm.shape[0]:
-            hdr.append("labels: " + ", ".join(class_names))
-        mat = ["\n".join([
-            " ".join([f"{v:5d}" for v in row]) for row in cm
-        ])]
-        return hdr + mat  # type: ignore
-
-    lines += _cm_to_str(cm_direct, "Confusion Matrix (Direct)")
-    lines.append("")
-    lines += _cm_to_str(cm_stacked, "Confusion Matrix (Stacked)")
+    lines.append("----- Confusion Matrix (Stacked) -----")
+    lines.append(df_cm_stacked.to_string())
     lines.append("")
 
-    # Classification reports
     lines.append("----- Classification Report (Direct) -----")
-    lines.append(classification_report(y_true, y_pred_direct, target_names=class_names, digits=4))
+    lines.append(cr_direct)
     lines.append("----- Classification Report (Stacked) -----")
-    lines.append(classification_report(y_true, y_pred_stacked, target_names=class_names, digits=4))
+    lines.append(cr_stacked)
 
     text = "\n".join(lines)
+
+    # 화면 출력
     print(text)
 
+    # 파일 저장(append)
     if file_path:
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
         with open(file_path, "a", encoding="utf-8") as f:
             f.write(text + "\n")
 
