@@ -147,43 +147,144 @@ N_TRIALS   = 30   # Optuna 탐색 횟수
 TEST_ID = 1  # (요구사항 1) 실험 식별자 (사용자 설정)
 # 각 TEST_ID별 모델 조합과 하이퍼파라미터 탐색 공간 정의 (요구사항 2)
 # - 새로운 모델 조합을 쉽게 추가/변경할 수 있도록 딕셔너리 구조 사용 (요구사항 5)
-MODEL_CONFIGS: Dict[int, Dict[str, Any]] = {
+MODEL_CONFIGS = {
+    # 1) Baseline (참고용): RF + GBR → Ridge(meta), passthrough=False
     1: {
+        "desc": "RF + GBR -> Ridge (baseline)",
+        "stack_kwargs": {"passthrough": False},  # StackingRegressor 옵션
         "base_models": [
-            ("rf", RandomForestRegressor, {"random_state": RANDOM_STATE, "n_jobs": -1}),
-            ("gbr", GradientBoostingRegressor, {"random_state": RANDOM_STATE})
+            ("rf",  "RandomForestRegressor", {"random_state": RANDOM_STATE, "n_jobs": -1}),
+            ("gbr", "GradientBoostingRegressor", {"random_state": RANDOM_STATE}),
         ],
-        "final_model": ("ridge", Ridge, {}),
+        "final_model": ("ridge", "Ridge", {}),
         "param_space": {
-            "rf_n_estimators": ("int", 100, 700, 50),
-            "rf_max_depth": ("int", 3, 20),
-            "rf_min_samples_leaf": ("int", 2, 5),
-            "gbr_n_estimators": ("int", 100, 700, 50),
-            "gbr_learning_rate": ("float", 1e-2, 0.2, "log"),
-            "gbr_max_depth": ("int", 2, 6),
-            "ridge_alpha": ("float", 1e-2, 10, "log")
-        }
+            "rf_n_estimators":       ("int",   200, 1000, 100),
+            "rf_max_depth":          ("int",     3,   20),
+            "rf_min_samples_leaf":   ("int",     1,    5),
+            "gbr_n_estimators":      ("int",   200, 1000, 100),
+            "gbr_learning_rate":     ("float", 1e-3,  0.2, "log"),
+            "gbr_max_depth":         ("int",     2,    6),
+            "ridge_alpha":           ("float", 1e-3,  1e2, "log"),
+        },
     },
+
+    # 2) 권장안 A: HGBR + ExtraTrees → Ridge(meta), 다양성↑, 설치무관(sklearn)
     2: {
+        "desc": "HGBR + ExtraTrees -> Ridge",
+        "stack_kwargs": {"passthrough": False},
         "base_models": [
-            ("rf", RandomForestRegressor, {"random_state": RANDOM_STATE, "n_jobs": -1}),
-            ("gbr", GradientBoostingRegressor, {"random_state": RANDOM_STATE}),
-            ("ridge", Ridge, {})
+            ("hgbr", "HistGradientBoostingRegressor", {"random_state": RANDOM_STATE}),
+            ("etr",  "ExtraTreesRegressor", {"random_state": RANDOM_STATE, "n_jobs": -1}),
         ],
-        "final_model": ("rf_final", RandomForestRegressor, {"random_state": RANDOM_STATE, "n_jobs": -1}),
+        "final_model": ("ridge", "Ridge", {}),
         "param_space": {
-            "rf_n_estimators": ("int", 100, 700, 50),
-            "rf_max_depth": ("int", 3, 20),
-            "rf_min_samples_leaf": ("int", 2, 5),
-            "gbr_n_estimators": ("int", 100, 700, 50),
-            "gbr_learning_rate": ("float", 1e-2, 0.2, "log"),
-            "gbr_max_depth": ("int", 2, 6),
-            "ridge_alpha": ("float", 1e-2, 10, "log"),
-            "rf_final_n_estimators": ("int", 100, 500, 50),
-            "rf_final_max_depth": ("int", 3, 15)
-        }
+            "hgbr_max_depth":        ("int",     2,   10),
+            "hgbr_learning_rate":    ("float", 1e-3, 0.3, "log"),
+            "hgbr_max_bins":         ("int",    32,  255),
+            "hgbr_l2_regularization":("float", 1e-6, 1e-1, "log"),
+
+            "etr_n_estimators":      ("int",   200, 1000, 100),
+            "etr_max_depth":         ("int",     3,   20),
+            "etr_max_features":      ("categorical", ["auto","sqrt","log2"]),
+
+            "ridge_alpha":           ("float", 1e-3, 1e2, "log"),
+        },
+    },
+
+    # 3) 권장안 B: LightGBM + ExtraTrees → ElasticNet(meta), passthrough=True (외부 의존)
+    3: {
+        "desc": "LightGBM + ExtraTrees -> ElasticNet (passthrough=True) [requires lightgbm]",
+        "stack_kwargs": {"passthrough": True},
+        "base_models": [
+            ("lgbm", "LGBMRegressor", {"random_state": RANDOM_STATE, "n_jobs": -1}),  # external: lightgbm
+            ("etr",  "ExtraTreesRegressor", {"random_state": RANDOM_STATE, "n_jobs": -1}),
+        ],
+        "final_model": ("enet", "ElasticNet", {"random_state": RANDOM_STATE}),
+        "param_space": {
+            # LightGBM 핵심
+            "lgbm_num_leaves":       ("int",    15,   255),
+            "lgbm_learning_rate":    ("float", 1e-3,  0.2, "log"),
+            "lgbm_n_estimators":     ("int",   200, 1000, 100),
+            "lgbm_max_depth":        ("int",     -1,   16),
+
+            # ExtraTrees
+            "etr_n_estimators":      ("int",   200, 1000, 100),
+            "etr_max_depth":         ("int",     3,   20),
+            "etr_max_features":      ("categorical", ["auto","sqrt","log2"]),
+
+            # ElasticNet
+            "enet_alpha":            ("float", 1e-4, 10.0, "log"),
+            "enet_l1_ratio":         ("float", 0.05, 0.95),
+        },
+    },
+
+    # 4) 권장안 C: CatBoost + Ridge(meta), passthrough=True (외부 의존)
+    4: {
+        "desc": "CatBoost -> Ridge (passthrough=True) [requires catboost]",
+        "stack_kwargs": {"passthrough": True},
+        "base_models": [
+            ("cbr", "CatBoostRegressor", {"random_seed": 42, "verbose": 0}),  # external: catboost
+        ],
+        "final_model": ("ridge", "Ridge", {}),
+        "param_space": {
+            "cbr_depth":             ("int",    4,   10),
+            "cbr_learning_rate":     ("float", 1e-3, 0.3, "log"),
+            "cbr_l2_leaf_reg":       ("float", 1.0,  10.0),
+            "cbr_iterations":        ("int",   300, 1200, 100),
+
+            "ridge_alpha":           ("float", 1e-3, 1e2, "log"),
+        },
+    },
+
+    # 5) 이종 GBMs: HGBR(얕음, 큰 lr) + GBR(깊음, 작은 lr) → ElasticNet(meta)
+    5: {
+        "desc": "HGBR(shallow, high-lr) + GBR(deeper, low-lr) -> ElasticNet",
+        "stack_kwargs": {"passthrough": False},
+        "base_models": [
+            ("hgbr", "HistGradientBoostingRegressor", {"random_state": RANDOM_STATE}),
+            ("gbr",  "GradientBoostingRegressor", {"random_state": RANDOM_STATE}),
+        ],
+        "final_model": ("enet", "ElasticNet", {"random_state": RANDOM_STATE}),
+        "param_space": {
+            # shallow HGBR
+            "hgbr_max_depth":        ("int",    2,    6),
+            "hgbr_learning_rate":    ("float", 0.05, 0.5, "log"),
+            "hgbr_max_bins":         ("int",   32,  255),
+
+            # deeper GBR
+            "gbr_n_estimators":      ("int",   400, 1500, 100),
+            "gbr_learning_rate":     ("float", 1e-3, 0.05, "log"),
+            "gbr_max_depth":         ("int",     3,    8),
+
+            # ElasticNet
+            "enet_alpha":            ("float", 1e-4, 10.0, "log"),
+            "enet_l1_ratio":         ("float", 0.05, 0.95),
+        },
+    },
+
+    # 6) RF + ExtraTrees → Ridge(meta), passthrough=True (내부만, 설치무관)
+    6: {
+        "desc": "RF + ExtraTrees -> Ridge (passthrough=True)",
+        "stack_kwargs": {"passthrough": True},
+        "base_models": [
+            ("rf",  "RandomForestRegressor", {"random_state": RANDOM_STATE, "n_jobs": -1}),
+            ("etr", "ExtraTreesRegressor",   {"random_state": RANDOM_STATE, "n_jobs": -1}),
+        ],
+        "final_model": ("ridge", "Ridge", {}),
+        "param_space": {
+            "rf_n_estimators":       ("int",   200, 1000, 100),
+            "rf_max_depth":          ("int",     3,   20),
+            "rf_min_samples_leaf":   ("int",     1,    5),
+
+            "etr_n_estimators":      ("int",   200, 1000, 100),
+            "etr_max_depth":         ("int",     3,   20),
+            "etr_max_features":      ("categorical", ["auto","sqrt","log2"]),
+
+            "ridge_alpha":           ("float", 1e-3, 1e2, "log"),
+        },
     },
 }
+
 # 선택한 TEST_ID에 해당하는 구성만 실행하도록 설정 (요구사항 3)
 if TEST_ID not in MODEL_CONFIGS:
     print(f"[Error] Undefined TEST_ID: {TEST_ID}. Please check MODEL_CONFIGS.")
