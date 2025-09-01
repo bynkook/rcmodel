@@ -104,9 +104,10 @@ import json
 import warnings
 import joblib
 import numpy as np
-import optuna
+
 import pandas as pd
-from typing import Dict, List, Tuple, Any
+from pathlib import Path
+from typing import Dict, List, Tuple, Any, Optional
 from tqdm.auto import tqdm
 
 from sklearn.base import clone
@@ -116,22 +117,26 @@ from sklearn.pipeline import Pipeline
 from sklearn.model_selection import KFold, train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import RobustScaler, StandardScaler, MinMaxScaler, FunctionTransformer, OneHotEncoder
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, StackingRegressor
-from sklearn.linear_model import Ridge
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, StackingRegressor, HistGradientBoostingRegressor, ExtraTreesRegressor
+from sklearn.linear_model import Ridge, ElasticNet
+from lightgbm import LGBMRegressor
+from catboost import CatBoostRegressor
 from sklearn import __version__ as sk_version
 from sklearnex import patch_sklearn
 patch_sklearn()
+import optuna
+from optuna.pruners import MedianPruner
 
 pd.set_option("display.max_columns", None)
 pd.set_option("display.width", 200)
-warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=UserWarning) # 사용자 코드에 의해 생성되는 경고 무시
 # optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # ========================= 사용자 설정 (CONFIGURATION) =========================
 # --- 데이터 및 모델 관련 설정 ---
 DATA_CSV   = "batch_analysis_rect_result.csv"
-COL_FEAT   = ['f_idx', 'width', 'height', 'Sm', 'bd', 'rho', 'phi_mn']
-COL_TGTS   = ['Sm', 'bd', 'rho', 'phi_mn']
+COL_FEAT   = ['f_idx', 'width', 'height', 'Sm', 'bd', 'rho', 'phi_mn']  # 학습 컬럼 정의
+COL_TGTS   = ['Sm', 'bd', 'rho', 'phi_mn']  # 타겟 컬럼 정의
 MUT_EXCL   = {'as_provided': ['phi_mn'], 'phi_mn': ['as_provided']} # 특정 타겟 학습 시 제외할 피처
 
 # --- 학습 프로세스 제어 ---
@@ -142,13 +147,17 @@ CV_FOLDS     = 5  # 교차 검증 폴드 수
 # --- Optuna 하이퍼파라미터 탐색 제어 ---
 USE_OPTUNA = True # True: Optuna 탐색 실행 | False: 저장된 파라미터 사용
 N_TRIALS   = 30   # Optuna 탐색 횟수
+USE_PRUNING = True  # 폴드 단위 중간 결과 기반 프루닝 사용 여부
+# KFold 기반 중간 보고 프루너. warmup 폴드(=n_warmup_steps) 이후부터 비교 시작
+PRUNER = MedianPruner(n_startup_trials=5, n_warmup_steps=2, interval_steps=1)
 
 # --- 실험/모델 구성 설정 ---
-TEST_ID = 1  # (요구사항 1) 실험 식별자 (사용자 설정)
-# 각 TEST_ID별 모델 조합과 하이퍼파라미터 탐색 공간 정의 (요구사항 2)
-# - 새로운 모델 조합을 쉽게 추가/변경할 수 있도록 딕셔너리 구조 사용 (요구사항 5)
+TEST_ID = 3
+# 각 TEST_ID별 모델 조합과 하이퍼파라미터 탐색 공간 정의
+# - 새로운 모델 조합을 쉽게 추가/변경할 수 있도록 딕셔너리 구조 사용
+
 MODEL_CONFIGS = {
-    # 1) Baseline (참고용): RF + GBR → Ridge(meta), passthrough=False
+    # 1) Baseline: RF + GBR → Ridge(meta), passthrough=False
     1: {
         "desc": "RF + GBR -> Ridge (baseline)",
         "stack_kwargs": {"passthrough": False},  # StackingRegressor 옵션
@@ -158,17 +167,17 @@ MODEL_CONFIGS = {
         ],
         "final_model": ("ridge", "Ridge", {}),
         "param_space": {
-            "rf_n_estimators":       ("int",   200, 1000, 100),
-            "rf_max_depth":          ("int",     3,   20),
-            "rf_min_samples_leaf":   ("int",     1,    5),
-            "gbr_n_estimators":      ("int",   200, 1000, 100),
-            "gbr_learning_rate":     ("float", 1e-3,  0.2, "log"),
-            "gbr_max_depth":         ("int",     2,    6),
-            "ridge_alpha":           ("float", 1e-3,  1e2, "log"),
+            "rf_n_estimators":       ("int",     50,  200,  10),
+            "rf_max_depth":          ("int",      3,   12),
+            "rf_min_samples_leaf":   ("int",      1,    5),
+            "gbr_n_estimators":      ("int",     50,  200,  10),
+            "gbr_learning_rate":     ("float", 1e-2,  1.0, "log"),
+            "gbr_max_depth":         ("int",      3,    6),
+            "ridge_alpha":           ("float", 1e-3,  100, "log"),
         },
     },
 
-    # 2) 권장안 A: HGBR + ExtraTrees → Ridge(meta), 다양성↑, 설치무관(sklearn)
+    # 2) HGBR + ExtraTrees → Ridge(meta), 다양성↑
     2: {
         "desc": "HGBR + ExtraTrees -> Ridge",
         "stack_kwargs": {"passthrough": False},
@@ -178,61 +187,50 @@ MODEL_CONFIGS = {
         ],
         "final_model": ("ridge", "Ridge", {}),
         "param_space": {
-            "hgbr_max_depth":        ("int",     2,   10),
-            "hgbr_learning_rate":    ("float", 1e-3, 0.3, "log"),
-            "hgbr_max_bins":         ("int",    32,  255),
-            "hgbr_l2_regularization":("float", 1e-6, 1e-1, "log"),
-
-            "etr_n_estimators":      ("int",   200, 1000, 100),
-            "etr_max_depth":         ("int",     3,   20),
-            "etr_max_features":      ("categorical", ["auto","sqrt","log2"]),
-
-            "ridge_alpha":           ("float", 1e-3, 1e2, "log"),
+            "hgbr_max_depth":        ("int",      3,   20),
+            "hgbr_learning_rate":    ("float", 1e-2,  1.0, "log"),
+            "hgbr_l2_regularization":("float", 1e-5,  0.1, "log"),
+            "etr_n_estimators":      ("int",     50,  200,  10),
+            "etr_max_depth":         ("int",      3,   12),
+            "ridge_alpha":           ("float", 1e-3,  100, "log"),
         },
     },
 
-    # 3) 권장안 B: LightGBM + ExtraTrees → ElasticNet(meta), passthrough=True (외부 의존)
+    # 3) LightGBM + ExtraTrees → ElasticNet(meta), passthrough=True
     3: {
         "desc": "LightGBM + ExtraTrees -> ElasticNet (passthrough=True) [requires lightgbm]",
         "stack_kwargs": {"passthrough": True},
         "base_models": [
-            ("lgbm", "LGBMRegressor", {"random_state": RANDOM_STATE, "n_jobs": -1}),  # external: lightgbm
+            ("lgbm", "LGBMRegressor", {"random_state": RANDOM_STATE, "n_jobs": -1, "verbose": -1}),
             ("etr",  "ExtraTreesRegressor", {"random_state": RANDOM_STATE, "n_jobs": -1}),
         ],
         "final_model": ("enet", "ElasticNet", {"random_state": RANDOM_STATE}),
         "param_space": {
-            # LightGBM 핵심
-            "lgbm_num_leaves":       ("int",    15,   255),
-            "lgbm_learning_rate":    ("float", 1e-3,  0.2, "log"),
-            "lgbm_n_estimators":     ("int",   200, 1000, 100),
-            "lgbm_max_depth":        ("int",     -1,   16),
-
-            # ExtraTrees
-            "etr_n_estimators":      ("int",   200, 1000, 100),
-            "etr_max_depth":         ("int",     3,   20),
-            "etr_max_features":      ("categorical", ["auto","sqrt","log2"]),
-
-            # ElasticNet
-            "enet_alpha":            ("float", 1e-4, 10.0, "log"),
+            "lgbm_num_leaves":       ("int",     15,  255),
+            "lgbm_learning_rate":    ("float", 1e-2,  1.0, "log"),
+            "lgbm_n_estimators":     ("int",     50,  200,  10),
+            "lgbm_max_depth":        ("int",     -1,   20),
+            "etr_n_estimators":      ("int",     50,  200,  10),
+            "etr_max_depth":         ("int",      3,   12),
+            "enet_alpha":            ("float", 1e-3,   10, "log"),
             "enet_l1_ratio":         ("float", 0.05, 0.95),
         },
     },
 
-    # 4) 권장안 C: CatBoost + Ridge(meta), passthrough=True (외부 의존)
+    # 4) CatBoost + Ridge(meta), passthrough=True
     4: {
         "desc": "CatBoost -> Ridge (passthrough=True) [requires catboost]",
         "stack_kwargs": {"passthrough": True},
         "base_models": [
-            ("cbr", "CatBoostRegressor", {"random_seed": 42, "verbose": 0}),  # external: catboost
+            ("cbr", "CatBoostRegressor", {"random_seed": RANDOM_STATE, "verbose": 0}),
         ],
         "final_model": ("ridge", "Ridge", {}),
         "param_space": {
-            "cbr_depth":             ("int",    4,   10),
-            "cbr_learning_rate":     ("float", 1e-3, 0.3, "log"),
-            "cbr_l2_leaf_reg":       ("float", 1.0,  10.0),
+            "cbr_depth":             ("int",    3,    20),
+            "cbr_learning_rate":     ("float", 1e-3, 1.0, "log"),
+            "cbr_l2_leaf_reg":       ("float", 1.0,   10),
             "cbr_iterations":        ("int",   300, 1200, 100),
-
-            "ridge_alpha":           ("float", 1e-3, 1e2, "log"),
+            "ridge_alpha":           ("float", 1e-3, 100, "log"),
         },
     },
 
@@ -246,23 +244,18 @@ MODEL_CONFIGS = {
         ],
         "final_model": ("enet", "ElasticNet", {"random_state": RANDOM_STATE}),
         "param_space": {
-            # shallow HGBR
-            "hgbr_max_depth":        ("int",    2,    6),
-            "hgbr_learning_rate":    ("float", 0.05, 0.5, "log"),
-            "hgbr_max_bins":         ("int",   32,  255),
-
-            # deeper GBR
-            "gbr_n_estimators":      ("int",   400, 1500, 100),
-            "gbr_learning_rate":     ("float", 1e-3, 0.05, "log"),
-            "gbr_max_depth":         ("int",     3,    8),
-
-            # ElasticNet
-            "enet_alpha":            ("float", 1e-4, 10.0, "log"),
+            "hgbr_max_depth":        ("int",    2,     20),
+            "hgbr_learning_rate":    ("float", 0.05,  0.5, "log"),
+            "hgbr_max_bins":         ("int",   32,    255),
+            "gbr_n_estimators":      ("int",    50,   500,  25),
+            "gbr_learning_rate":     ("float", 1e-3,  1.0, "log"),
+            "gbr_max_depth":         ("int",     3,     8),
+            "enet_alpha":            ("float", 1e-3,   10, "log"),
             "enet_l1_ratio":         ("float", 0.05, 0.95),
         },
     },
 
-    # 6) RF + ExtraTrees → Ridge(meta), passthrough=True (내부만, 설치무관)
+    # 6) RF + ExtraTrees → Ridge(meta), passthrough=True
     6: {
         "desc": "RF + ExtraTrees -> Ridge (passthrough=True)",
         "stack_kwargs": {"passthrough": True},
@@ -272,29 +265,43 @@ MODEL_CONFIGS = {
         ],
         "final_model": ("ridge", "Ridge", {}),
         "param_space": {
-            "rf_n_estimators":       ("int",   200, 1000, 100),
-            "rf_max_depth":          ("int",     3,   20),
-            "rf_min_samples_leaf":   ("int",     1,    5),
-
-            "etr_n_estimators":      ("int",   200, 1000, 100),
-            "etr_max_depth":         ("int",     3,   20),
-            "etr_max_features":      ("categorical", ["auto","sqrt","log2"]),
-
-            "ridge_alpha":           ("float", 1e-3, 1e2, "log"),
+            "rf_n_estimators":       ("int",   50,   500,  25),
+            "rf_max_depth":          ("int",    3,    20),
+            "rf_min_samples_leaf":   ("int",    1,     5),
+            "etr_n_estimators":      ("int",   50,   500,  25),
+            "etr_max_depth":         ("int",    3,    12),
+            "ridge_alpha":           ("float", 1e-3, 100, "log"),
         },
     },
 }
 
-# 선택한 TEST_ID에 해당하는 구성만 실행하도록 설정 (요구사항 3)
+# 선택한 TEST_ID에 해당하는 구성만 실행
 if TEST_ID not in MODEL_CONFIGS:
     print(f"[Error] Undefined TEST_ID: {TEST_ID}. Please check MODEL_CONFIGS.")
     sys.exit(1)
 SELECTED_CONFIG = MODEL_CONFIGS[TEST_ID]
+ESTIMATOR_REGISTRY = {
+    # model class 정의를 문자열과 매칭(json save, load 문제 해결)
+    "RandomForestRegressor": RandomForestRegressor,
+    "GradientBoostingRegressor": GradientBoostingRegressor,
+    "HistGradientBoostingRegressor": HistGradientBoostingRegressor,
+    "ExtraTreesRegressor": ExtraTreesRegressor,
+    "LGBMRegressor": LGBMRegressor,
+    "CatBoostRegressor": CatBoostRegressor,
+    "Ridge": Ridge,
+    "ElasticNet": ElasticNet
+    }
 
-# --- 출력 파일 이름 --- (요구사항 4: 기존 이름에 TEST_ID suffix 추가)
+# --- 출력 파일 이름 --- (기존 이름에 TEST_ID suffix 추가)
 OUT_BUNDLE         = f"stack_bundle_{TEST_ID}.joblib"
 OUT_SCORES         = f"stack_scores_{TEST_ID}.csv"
 HYPERPARAMS_FILE   = f"best_hyperparameters_{TEST_ID}.json"
+
+# 출력,입력 디렉토리 생성
+output_dir = Path('./output')
+output_dir.mkdir(exist_ok=True)
+input_dir = Path('./input')
+input_dir.mkdir(exist_ok=True)
 # =============================================================================
 
 
@@ -305,7 +312,7 @@ def build_feats_by_target(all_feats: List[str], targets: List[str]) -> Dict[str,
         ban = set(MUT_EXCL.get(tgt, []))
         # 타겟 자신과 상호 배타 피처를 제외
         feats = [c for c in all_feats if c != tgt and c not in ban]
-        feats_map[tgt] = feats
+        feats_map[tgt] = feats    
     return feats_map
 
 
@@ -361,14 +368,21 @@ def calculate_regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict
     }
 
 
-def evaluate_pipeline_kfold(pipe: Pipeline, X_df: pd.DataFrame, y: np.ndarray, n_splits: int) -> Tuple[Dict[str, float], List[Dict[str, float]]]:
+def evaluate_pipeline_kfold(
+    pipe: Pipeline,
+    X_df: pd.DataFrame,
+    y: np.ndarray,
+    n_splits: int,
+    trial: Optional[optuna.trial.Trial] = None,
+    prune_metric: str = "MAE",
+) -> Tuple[Dict[str, float], List[Dict[str, float]]]:
     """
     주어진 파이프라인에 대해 K-fold 교차 검증을 수행하고 성능 지표를 반환합니다.
     """
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
     fold_scores = []
 
-    for tr_idx, va_idx in kf.split(X_df):
+    for fold_idx, (tr_idx, va_idx) in enumerate(kf.split(X_df), start=1):
         X_tr, X_va = X_df.iloc[tr_idx], X_df.iloc[va_idx]
         y_tr, y_va = y[tr_idx], y[va_idx]
         
@@ -378,6 +392,13 @@ def evaluate_pipeline_kfold(pipe: Pipeline, X_df: pd.DataFrame, y: np.ndarray, n
         
         metrics = calculate_regression_metrics(y_va, y_hat)
         fold_scores.append(metrics)
+    
+    # --- Optuna pruning: 폴드별 누적 평균 MAE를 중간값으로 보고 ---
+    if trial is not None:
+        running_mean = np.mean([fs[prune_metric] for fs in fold_scores])
+        trial.report(running_mean, step=fold_idx)
+        if trial.should_prune():
+            raise optuna.TrialPruned()
         
     # 폴드별 점수의 평균 계산
     mean_scores = {metric: np.mean([s[metric] for s in fold_scores]) for metric in fold_scores[0]}
@@ -389,33 +410,46 @@ def make_stacking_pipeline(X: pd.DataFrame, params: Dict[str, Any]) -> Pipeline:
     """주어진 하이퍼파라미터로 Stacking 파이프라인을 구성합니다."""
     preprocessor = build_preprocessor(X)
 
-    # Base models (from SELECTED_CONFIG, 요구사항 2,3)
+    # Base models (from SELECTED_CONFIG)
     base_estimators: List[Tuple[str, Any]] = []
     for name, model_class, fixed_params in SELECTED_CONFIG["base_models"]:
         # 각 base model에 대해 고정 파라미터 복사 및 하이퍼파라미터 적용
+        if isinstance(model_class, str):
+            if model_class not in ESTIMATOR_REGISTRY:
+                raise KeyError(f'unknown estimator class name: {model_class}')
+            cls = ESTIMATOR_REGISTRY[model_class]
+        else:
+            cls = model_class
         model_params = fixed_params.copy()
         for key, value in params.items():
             if key.startswith(f"{name}_"):
                 param_name = key[len(name)+1:]
                 model_params[param_name] = value
-        model_instance = model_class(**model_params)
+        model_instance = cls(**model_params)
         base_estimators.append((name, model_instance))
     
-    # Final meta-model (from SELECTED_CONFIG, 요구사항 2,3)
+    # Final meta-model (from SELECTED_CONFIG)
     final_name, final_class, final_fixed_params = SELECTED_CONFIG["final_model"]
+    if isinstance(final_class, str):
+        if model_class not in ESTIMATOR_REGISTRY:
+            raise KeyError(f'unknown estimator class name: {final_class}')
+        final_cls = ESTIMATOR_REGISTRY[final_class]
+    else:
+        final_cls = model_class
     final_params = final_fixed_params.copy()
     for key, value in params.items():
         if key.startswith(f"{final_name}_"):
             param_name = key[len(final_name)+1:]
             final_params[param_name] = value
-    final_estimator = final_class(**final_params)
+    final_estimator = final_cls(**final_params)
 
+    stack_kwargs = SELECTED_CONFIG.get('stack_kwargs', {})
     stacking_regressor = StackingRegressor(
         estimators=base_estimators,
         final_estimator=final_estimator,
         cv=KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE),
         n_jobs=-1,
-        passthrough=False
+        **stack_kwargs
     )
     
     return Pipeline([("preprocessor", preprocessor), ("stacking_regressor", stacking_regressor)])
@@ -424,7 +458,7 @@ def make_stacking_pipeline(X: pd.DataFrame, params: Dict[str, Any]) -> Pipeline:
 def optuna_objective(trial: optuna.Trial, X_df: pd.DataFrame, y: np.ndarray) -> float:
     """Optuna 탐색을 위한 목적 함수."""
     params: Dict[str, Any] = {}
-    # SELECTED_CONFIG에 정의된 하이퍼파라미터 탐색 공간을 이용하여 파라미터 샘플링 (요구사항 2)
+    # SELECTED_CONFIG에 정의된 하이퍼파라미터 탐색 공간을 이용하여 파라미터 샘플링
     for param_name, spec in SELECTED_CONFIG["param_space"].items():
         if spec[0] == "int":
             low, high = spec[1], spec[2]
@@ -438,21 +472,25 @@ def optuna_objective(trial: optuna.Trial, X_df: pd.DataFrame, y: np.ndarray) -> 
             if len(spec) >= 4 and spec[3] == "log":
                 log_flag = True
             params[param_name] = trial.suggest_float(param_name, low, high, log=log_flag)
-        # 다른 타입의 하이퍼파라미터도 추가 가능 (예: categorical)
+            # categorical 변수 탐색 추가 가능
 
     pipeline = make_stacking_pipeline(X_df, params)
-    mean_scores, fold_scores = evaluate_pipeline_kfold(pipeline, X_df, y, n_splits=CV_FOLDS)
+    mean_scores, fold_scores = evaluate_pipeline_kfold(pipeline, X_df, y, n_splits=CV_FOLDS, trial=trial, prune_metric="MAE")
 
     # 콘솔에 상세 성능 출력
     print(f"[Trial {trial.number:03d}] CV Mean Scores: "
           f"MAE={mean_scores['MAE']:.5f}, RMSE={mean_scores['RMSE']:.5f}, R2={mean_scores['R2']:.5f}")
-          
-    return mean_scores['MAE']  # MAE를 최소화하는 것을 목표로 함
+
+    if trial.should_prune():
+        raise optuna.TrialPruned()
+              
+    return mean_scores['MAE']  # MAE 최소화
 
 
 def run_optuna_study(X_df: pd.DataFrame, y: np.ndarray, n_trials: int) -> Dict[str, Any]:
     """특정 타겟에 대해 Optuna 탐색을 실행하고 최적 파라미터를 반환합니다."""
-    study = optuna.create_study(direction="minimize")
+    pruner = PRUNER if USE_PRUNING else None
+    study = optuna.create_study(direction="minimize", pruner=pruner)
     objective_func = lambda trial: optuna_objective(trial, X_df, y)
     study.optimize(objective_func, n_trials=n_trials, show_progress_bar=True)
     
@@ -513,15 +551,14 @@ def generate_and_save_reports(
 
     # CSV 파일 저장
     report_df = pd.DataFrame(report_rows)[['target', 'dataset', 'MAE', 'RMSE', 'R2']]
-    report_df.to_csv(OUT_SCORES, index=False)
+    report_df.to_csv(output_dir / OUT_SCORES, encoding='utf-8-sig', index=False)
     print(f"\n[OK] Performance scores saved to: {OUT_SCORES}")
 
 
 def main():
     """메인 실행 함수"""
     df = pd.read_csv(DATA_CSV)
-    df = df[COL_FEAT + COL_TGTS] # 필요한 모든 컬럼 선택
-    df.drop_duplicates(inplace=True)
+    df = df[COL_FEAT] # 필요한 모든 컬럼 선택
 
     feats_by_tgt = build_feats_by_target(COL_FEAT, COL_TGTS)
     df_tr, df_te = train_test_split(df, test_size=TEST_SIZE, random_state=RANDOM_STATE)
@@ -532,7 +569,7 @@ def main():
 
     if not USE_OPTUNA:
         print(f"--- Skipping Optuna. Loading parameters from {HYPERPARAMS_FILE} ---")
-        best_params_by_tgt = load_hyperparameters(HYPERPARAMS_FILE)
+        best_params_by_tgt = load_hyperparameters(input_dir / HYPERPARAMS_FILE)
         # 로드된 파라미터가 모든 타겟에 대해 존재하는지 확인
         if not all(tgt in best_params_by_tgt for tgt in COL_TGTS):
             print("[Error] The hyperparameter file is missing parameters for some targets.")
@@ -564,9 +601,9 @@ def main():
 
     # Optuna를 사용했다면, 찾은 최적 파라미터를 파일에 저장
     if USE_OPTUNA:
-        save_hyperparameters(best_params_by_tgt, HYPERPARAMS_FILE)
+        save_hyperparameters(best_params_by_tgt, output_dir / HYPERPARAMS_FILE)
 
-    # 다른 앱과의 연동을 위한 번들 저장 (요구사항 5: 기존 구조 유지)
+    # 다른 앱과의 연동을 위한 번들 저장 (기존 구조 유지)
     bundle = {
         "models": models,
         "features_by_target": feats_by_tgt,
@@ -575,7 +612,7 @@ def main():
         "best_params_by_target": best_params_by_tgt,
         "sklearn_version": sk_version,
     }
-    joblib.dump(bundle, OUT_BUNDLE, compress=3)
+    joblib.dump(bundle, output_dir / OUT_BUNDLE, compress=3)
     print(f"\n[OK] Model bundle saved to: {OUT_BUNDLE}")
 
     # 최종 성능 리포트 생성 및 저장
