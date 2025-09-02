@@ -1,5 +1,5 @@
 """
-stacking_ensemble_titanic.py
+stacking_ensemble_titanic_refactored.py
 =================================
 
 Purpose
@@ -11,10 +11,12 @@ A clean, reusable stacking-ensemble classification pipeline with:
   3) create_features(df)
 - All other components are dataset-agnostic and reusable across projects
   (model training, stacking, evaluation, ROC/AUC, SHAP, saving outputs).
+- A stacking ensemble implemented using scikit-learn's StackingClassifier,
+  which trains base estimators and a meta-estimator on out-of-fold predictions (cv=5 by default).
 
 Reusable Components
 -------------------
-- StackedEnsembleClassifier: flexible base/meta estimators, probability/meta-feature options.
+- StackingClassifier (sklearn): ensemble meta-estimator combining multiple base classifiers.
 - create_multilabel_target: generic multi-class target creation from an arbitrary risk score.
 - evaluate_models: trains direct & stacked models; returns predictions & metrics (no printing).
 - plot_roc_auc: saves ROC curve image & returns AUC dictionary (per-class & micro-average).
@@ -22,6 +24,9 @@ Reusable Components
 - analyze_feature_importance_shap: SHAP summary & bar plots for final model (if supported).
 - print_result: central place to print ALL classification analysis text to screen AND file.
 - save_results: persist predictions and (optional) feature importances to CSV files.
+- print_feature_importance: prints top feature importances for a model and logs them to results.
+- print_roc_auc: computes ROC AUC metrics via plot_roc_auc, prints them and logs to results.
+- perform_shap_analysis: runs SHAP analysis for a model and logs the status (figures saved or skipped).
 
 Variable & Naming Conventions
 -----------------------------
@@ -29,7 +34,7 @@ Variable & Naming Conventions
 - X, y: feature matrix and target (standard ML convention).
 - X_train, X_test, y_train, y_test: train/test split.
 - direct_model: baseline single classifier (default RandomForestClassifier).
-- stacked_model: StackedEnsembleClassifier (base_clfs + meta_clf).
+- stacked_model: StackingClassifier (with base estimators + meta estimator).
 - y_pred_direct, y_pred_stacked: predictions for test set.
 - direct_accuracy, stacked_accuracy: accuracy scores.
 - class_names / target_names: optional list[str] used in reports/plots.
@@ -43,11 +48,13 @@ Outputs
 
 Notes
 -----
-- This script avoids unused imports. It uses only:
-    accuracy_score, classification_report, confusion_matrix, roc_curve, auc
-  (Removed: precision_recall_fscore_support, RocCurveDisplay, roc_auc_score)
-- ROC curve is already implemented; we DO NOT add any new plots besides saving existing ones.
-- SHAP is optional; handled with a try/except and only saved to files (no plt.show()).
+- The dataset is split into training (75%) and test (25%) sets (stratified by target).
+- The StackingClassifier uses 5-fold cross-validation on the training data to generate out-of-fold 
+  predictions from base estimators for training the meta-estimator. This prevents information leakage 
+  and overfitting in the stacking process. (No separate validation set is needed beyond this.)
+- Passthrough of original features to the meta-model can be toggled via STACKING_PASSTHROUGH (default False).
+- This script avoids unused imports and keeps main execution minimal by delegating tasks to functions.
+- ROC curve plotting and SHAP analysis are performed without showing interactive plots (figures saved to files only).
 """
 
 from __future__ import annotations
@@ -55,13 +62,12 @@ from __future__ import annotations
 import os
 import sys
 import warnings
-from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple, Dict, Any
 
 import numpy as np
 import pandas as pd
 
-from sklearn.base import BaseEstimator, ClassifierMixin, clone
+from sklearn.base import BaseEstimator
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
@@ -70,19 +76,16 @@ from sklearn.metrics import (
     auc,
 )
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, ExtraTreesClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, ExtraTreesClassifier, StackingClassifier
 from sklearn.linear_model import LogisticRegression
 
 import matplotlib
 matplotlib.use("Agg")  # ensure no GUI backend
 import matplotlib.pyplot as plt
 
-
-# --------------------------------------------------------------------------------------
-# Dataset-specific functions (Titanic). Keep these isolated for easy swapping per project
-# --------------------------------------------------------------------------------------
+# Configurable Stacking parameters
+STACKING_CV: int = 5        # number of CV folds for meta-model training in stacking
+STACKING_PASSTHROUGH: bool = False  # whether to include original features in meta-model input
 
 def load_and_explore_data() -> pd.DataFrame:
     """
@@ -102,7 +105,6 @@ def load_and_explore_data() -> pd.DataFrame:
     # Basic exploration prints (captured by logger/print_result later if needed)
     print(f"[INFO] Loaded Titanic: shape={df.shape}, columns={list(df.columns)}")
     return df
-
 
 def preprocess_titanic_data(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -132,7 +134,6 @@ def preprocess_titanic_data(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-
 def create_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Titanic-specific feature engineering:
@@ -161,11 +162,6 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.get_dummies(out, columns=cat_cols, drop_first=True)
 
     return out
-
-
-# --------------------------------------------------------------------------------------
-# Generic & reusable components below
-# --------------------------------------------------------------------------------------
 
 def create_multilabel_target(
     df: pd.DataFrame,
@@ -245,147 +241,18 @@ def create_multilabel_target(
     }
     return df_out, info
 
-
-@dataclass
-class StackedEnsembleClassifier(BaseEstimator, ClassifierMixin):
-    """
-    Generic stacking ensemble for multi-class classification.
-
-    Parameters
-    ----------
-    base_clfs : list[Estimator]
-        List of base classifiers. If None, defaults to 4 tree-based models.
-    meta_clf : Estimator
-        Meta-classifier to learn from base-level meta-features (probabilities or labels).
-    use_probabilities : bool
-        If True, pass base predicted probabilities to meta layer; else pass class labels.
-    scale_meta : bool
-        Whether to standardize meta-features before meta_clf.
-    random_state : int or None
-        For reproducibility (where supported).
-
-    Behavior
-    --------
-    - For K classes, we create binary one-vs-rest targets for a subset/classes_for_base.
-      To keep generality across different K:
-        * If K >= 5: exclude the highest class index (mimics paper's balance heuristic)
-        * Else: use all classes for base one-vs-rest tasks
-    - Base_clfs are trained per binary target. Their predictions build the meta-feature matrix.
-    - Meta_clf is then trained to predict the multi-class y.
-
-    Notes
-    -----
-    - This is intentionally simple (no CV-stacking). For stronger generalization, one could
-      implement out-of-fold meta-features, but this version stays fast and easy to reuse.
-    """
-    base_clfs: Optional[List[BaseEstimator]] = None
-    meta_clf: Optional[BaseEstimator] = None
-    use_probabilities: bool = True
-    scale_meta: bool = True
-    random_state: Optional[int] = 42
-
-    def __post_init__(self):
-        if self.base_clfs is None:
-            self.base_clfs = [
-                RandomForestClassifier(n_estimators=100, random_state=self.random_state),
-                GradientBoostingClassifier(n_estimators=100, random_state=self.random_state),
-                ExtraTreesClassifier(n_estimators=50, random_state=self.random_state),
-            ]
-        if self.meta_clf is None:
-            self.meta_clf = LogisticRegression(max_iter=200, multi_class="auto", n_jobs=None)
-
-        if self.scale_meta:
-            self.meta_pipeline_ = Pipeline([
-                ("scaler", StandardScaler(with_mean=False)),  # sparse-friendly
-                ("clf", clone(self.meta_clf)),
-            ])
-        else:
-            self.meta_pipeline_ = clone(self.meta_clf)
-
-        self.fitted_base_ = []
-        self.classes_ = None
-        self.classes_for_base_ = None
-
-    def _prepare_base_targets(self, y: np.ndarray) -> List[np.ndarray]:
-        classes = np.unique(y)
-        self.classes_ = classes
-        if len(classes) >= 5:
-            classes_for_base = classes[:-1]
-        else:
-            classes_for_base = classes
-        self.classes_for_base_ = classes_for_base
-
-        base_targets = []
-        for c in classes_for_base:
-            base_targets.append((y == c).astype(int))
-        return base_targets
-
-    def fit(self, X: np.ndarray, y: np.ndarray):
-        base_targets = self._prepare_base_targets(y)
-        self.fitted_base_ = []
-
-        # Train base classifiers per binary target
-        for idx, (c, t) in enumerate(zip(self.classes_for_base_, base_targets), start=1):
-            # Clone & fit each base clf for this binary problem
-            fitted_list = []
-            for b_i, base in enumerate(self.base_clfs, start=1):
-                clf = clone(base)
-                clf.fit(X, t)
-                fitted_list.append(clf)
-            self.fitted_base_.append((int(c), fitted_list))
-        # Train meta on meta-features
-        meta_X = self._build_meta_features(X)
-        self.meta_pipeline_.fit(meta_X, y)
-        return self
-
-    def _build_meta_features(self, X: np.ndarray) -> np.ndarray:
-        blocks = []
-        for c, clfs in self.fitted_base_:
-            # stack predictions from all base clfs on this binary task
-            if self.use_probabilities and hasattr(clfs[0], "predict_proba"):
-                # concatenate probability of positive class (1) for each base clf
-                probs = [clf.predict_proba(X)[:, 1] for clf in clfs]
-                block = np.vstack(probs).T  # shape (n_samples, n_base)
-            else:
-                preds = [clf.predict(X) for clf in clfs]
-                block = np.vstack(preds).T
-            blocks.append(block)
-        if not blocks:
-            raise RuntimeError("No base learners were trained to generate meta-features.")
-        meta_X = np.hstack(blocks)
-        return meta_X
-
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        meta_X = self._build_meta_features(X)
-        return self.meta_pipeline_.predict(meta_X)
-
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        # Provide class probability estimates if meta supports it
-        meta_X = self._build_meta_features(X)
-        if hasattr(self.meta_pipeline_, "predict_proba"):
-            return self.meta_pipeline_.predict_proba(meta_X)
-        # Fallback via decision function -> softmax
-        if hasattr(self.meta_pipeline_, "decision_function"):
-            dec = self.meta_pipeline_.decision_function(meta_X)
-            # handle binary vs multiclass
-            if dec.ndim == 1:
-                dec = np.vstack([-dec, dec]).T
-            e = np.exp(dec - dec.max(axis=1, keepdims=True))
-            return e / e.sum(axis=1, keepdims=True)
-        raise AttributeError("Meta classifier does not support probability estimates.")
-
-
 def evaluate_models(
     X_train: np.ndarray,
     X_test: np.ndarray,
     y_train: np.ndarray,
     y_test: np.ndarray,
     direct_model: Optional[BaseEstimator] = None,
-    stacked_model: Optional[StackedEnsembleClassifier] = None,
+    stacked_model: Optional[StackingClassifier] = None,
 ) -> Dict[str, Any]:
     """
     Train a direct baseline model and a stacked ensemble; compute predictions & accuracies.
-
+    If no model instances are provided, uses RandomForestClassifier as direct model and a 
+    StackingClassifier (with default base estimators and LogisticRegression meta-estimator).
     Returns
     -------
     out : dict
@@ -399,8 +266,18 @@ def evaluate_models(
         direct_model = RandomForestClassifier(n_estimators=300, random_state=42)
 
     if stacked_model is None:
-        stacked_model = StackedEnsembleClassifier(
-            base_clfs=None, meta_clf=None, use_probabilities=True, scale_meta=True, random_state=42
+        base_estimators = [
+            ("rf", RandomForestClassifier(n_estimators=100, random_state=42)),
+            ("gb", GradientBoostingClassifier(n_estimators=100, random_state=42)),
+            ("et", ExtraTreesClassifier(n_estimators=50, random_state=42)),
+        ]
+        final_estimator = LogisticRegression(max_iter=300, multi_class="auto", n_jobs=None)
+        stacked_model = StackingClassifier(
+            estimators=base_estimators,
+            final_estimator=final_estimator,
+            cv=STACKING_CV,
+            passthrough=STACKING_PASSTHROUGH,
+            n_jobs=None
         )
 
     direct_model.fit(X_train, y_train)
@@ -419,7 +296,6 @@ def evaluate_models(
         "direct_accuracy": direct_accuracy,
         "stacked_accuracy": stacked_accuracy,
     }
-
 
 def plot_roc_auc(
     model: BaseEstimator,
@@ -482,7 +358,6 @@ def plot_roc_auc(
 
     return auc_dict
 
-
 def analyze_feature_importance(
     model: BaseEstimator, feature_names: List[str], top_k: int = 20
 ) -> Optional[pd.DataFrame]:
@@ -498,7 +373,6 @@ def analyze_feature_importance(
         })
         return df_imp
     return None
-
 
 def analyze_feature_importance_shap(
     model: BaseEstimator,
@@ -558,7 +432,6 @@ def analyze_feature_importance_shap(
 
     except Exception as e:
         warnings.warn(f"SHAP analysis skipped: {e}")
-
 
 def print_result(
     y_true: np.ndarray,
@@ -630,7 +503,6 @@ def print_result(
         with open(file_path, "a", encoding="utf-8") as f:
             f.write(text + "\n")
 
-
 def save_results(
     X_test: pd.DataFrame,
     y_test: np.ndarray,
@@ -654,11 +526,89 @@ def save_results(
     if feature_importances is not None:
         feature_importances.to_csv(imp_csv_path, index=False)
 
+def print_feature_importance(
+    model: BaseEstimator,
+    feature_names: List[str],
+    top_k: int = 20,
+    model_name: str = "Direct Model",
+    file_path: Optional[str] = "output/results.txt",
+) -> Optional[pd.DataFrame]:
+    """
+    Print top-k feature importances for the given model to console and append to results file.
+    Returns the DataFrame of importances (or None).
+    """
+    imp_df = analyze_feature_importance(model, feature_names, top_k)
+    if imp_df is not None:
+        header = f"\n----- Top Feature Importances ({model_name}) -----"
+        print(header)
+        print(imp_df.to_string(index=False))
+        if file_path:
+            with open(file_path, "a", encoding="utf-8") as f:
+                f.write(header + "\n")
+                f.write(imp_df.to_string(index=False) + "\n")
+    return imp_df
+
+def print_roc_auc(
+    model: BaseEstimator,
+    X: np.ndarray,
+    y: np.ndarray,
+    class_names: Optional[List[str]] = None,
+    title: str = "ROC Curve (Test - Stacked)",
+    savepath: str = "output/roc_curve_test.png",
+    file_path: Optional[str] = "output/results.txt",
+) -> None:
+    """
+    Compute ROC AUC using plot_roc_auc and print AUC results to console and file.
+    """
+    try:
+        auc_map = plot_roc_auc(model=model, X=X, y=y, class_names=class_names, title=title, savepath=savepath, show_plot=False)
+        auc_round = {k: round(v, 6) for k, v in auc_map.items()}
+        print(f"\n[AUC per class + micro] {auc_round}")
+        if file_path:
+            with open(file_path, "a", encoding="utf-8") as f:
+                f.write(f"\n[AUC per class + micro] {auc_round}\n")
+    except Exception as e:
+        msg = f"[WARN] ROC/AUC skipped: {e}"
+        print(msg)
+        if file_path:
+            with open(file_path, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+
+def perform_shap_analysis(
+    model: BaseEstimator,
+    X: np.ndarray,
+    feature_names: Optional[List[str]] = None,
+    title_prefix: str = "SHAP",
+    savepath_prefix: str = "output/shap_test",
+    file_path: Optional[str] = "output/results.txt",
+) -> None:
+    """
+    Run SHAP analysis for the model (using analyze_feature_importance_shap) and log results.
+    """
+    try:
+        analyze_feature_importance_shap(
+            model=model,
+            X=X,
+            feature_names=feature_names,
+            title_prefix=title_prefix,
+            savepath_prefix=savepath_prefix,
+            show_plot=False,
+        )
+        info_msg = f"[INFO] SHAP plots saved: {savepath_prefix}_beeswarm.png, {savepath_prefix}_bar.png"
+        print(info_msg)
+        if file_path:
+            with open(file_path, "a", encoding="utf-8") as f:
+                f.write(info_msg + "\n")
+    except Exception as e:
+        warn_msg = f"[WARN] SHAP analysis skipped: {e}"
+        print(warn_msg)
+        if file_path:
+            with open(file_path, "a", encoding="utf-8") as f:
+                f.write(warn_msg + "\n")
 
 # --------------------------------------------------------------------------------------
 # Main (project-specific wiring only)
 # --------------------------------------------------------------------------------------
-
 def main():
     # Ensure output directory exists
     os.makedirs("output", exist_ok=True)
@@ -696,13 +646,11 @@ def main():
         X, y, test_size=0.25, random_state=42, stratify=y
     )
 
-    # 5) Evaluate direct & stacked models (reusable wrapper)
+    # 5) Evaluate direct & stacked models
     results = evaluate_models(
         X_train, X_test, y_train, y_test,
-        direct_model=RandomForestClassifier(n_estimators=400, random_state=42),
-        stacked_model=StackedEnsembleClassifier(
-            base_clfs=None, meta_clf=LogisticRegression(max_iter=300), use_probabilities=True, scale_meta=True
-        ),
+        direct_model=RandomForestClassifier(n_estimators=400, random_state=42)
+        # stacked_model will use default StackingClassifier
     )
     direct_model = results["direct_model"]
     stacked_model = results["stacked_model"]
@@ -711,8 +659,7 @@ def main():
     direct_accuracy = results["direct_accuracy"]
     stacked_accuracy = results["stacked_accuracy"]
 
-    # 6) Centralized printing of all metrics (also saved to output/results.txt)
-    #    (Text-only: accuracy, confusion matrices, classification reports)
+    # 6) Print metrics and reports (to console and file)
     print_result(
         y_true=y_test,
         y_pred_direct=y_pred_direct,
@@ -723,53 +670,29 @@ def main():
         file_path="output/results.txt",
     )
 
-    # 7) Feature importance for direct model (if available)
-    imp_df = analyze_feature_importance(direct_model, feature_cols, top_k=25)
-    if imp_df is not None:
-        print("\n----- Top Feature Importances (Direct Model) -----")
-        print(imp_df.to_string(index=False))
-        with open("output/results.txt", "a", encoding="utf-8") as f:
-            f.write("\n----- Top Feature Importances (Direct Model) -----\n")
-            f.write(imp_df.to_string(index=False) + "\n")
+    # 7) Feature importance for direct model
+    imp_df = print_feature_importance(direct_model, feature_cols, top_k=25, model_name="Direct Model")
 
-    # 8) ROC/AUC for the stacked model (save figure; also print AUC map)
-    try:
-        auc_map = plot_roc_auc(
-            model=stacked_model,
-            X=X_test,
-            y=y_test,
-            class_names=class_names,
-            title="ROC Curve (Test - Stacked)",
-            savepath="output/roc_curve_test.png",
-            show_plot=False,  # do not display; only save
-        )
-        print("\n[AUC per class + micro] ", {k: round(v, 6) for k, v in auc_map.items()})
-        with open("output/results.txt", "a", encoding="utf-8") as f:
-            f.write("\n[AUC per class + micro] " + str({k: round(v, 6) for k, v in auc_map.items()}) + "\n")
-    except Exception as e:
-        msg = f"[WARN] ROC/AUC skipped: {e}"
-        print(msg)
-        with open("output/results.txt", "a", encoding="utf-8") as f:
-            f.write(msg + "\n")
+    # 8) ROC/AUC for the stacked model (save figure; also print AUC values)
+    print_roc_auc(
+        model=stacked_model,
+        X=X_test,
+        y=y_test,
+        class_names=class_names,
+        title="ROC Curve (Test - Stacked)",
+        savepath="output/roc_curve_test.png",
+        file_path="output/results.txt",
+    )
 
-    # 9) SHAP analysis for stacked model (saved to files only)
-    try:
-        analyze_feature_importance_shap(
-            model=stacked_model,
-            X=X_test,
-            feature_names=feature_cols,
-            title_prefix="SHAP (Test - Stacked)",
-            savepath_prefix="output/shap_test",
-            show_plot=False,  # save only
-        )
-        print("[INFO] SHAP plots saved: output/shap_test_beeswarm.png, output/shap_test_bar.png")
-        with open("output/results.txt", "a", encoding="utf-8") as f:
-            f.write("[INFO] SHAP plots saved: output/shap_test_beeswarm.png, output/shap_test_bar.png\n")
-    except Exception as e:
-        msg = f"[WARN] SHAP analysis skipped: {e}"
-        print(msg)
-        with open("output/results.txt", "a", encoding="utf-8") as f:
-            f.write(msg + "\n")
+    # 9) SHAP analysis for stacked model (figures saved to files)
+    perform_shap_analysis(
+        model=stacked_model,
+        X=X_test,
+        feature_names=feature_cols,
+        title_prefix="SHAP (Test - Stacked)",
+        savepath_prefix="output/shap_test",
+        file_path="output/results.txt",
+    )
 
     # 10) Save predictions & importances to CSV under ./output
     save_results(
@@ -783,7 +706,6 @@ def main():
     )
 
     print("\n[INFO] All outputs saved under ./output (no subdirectories).")
-
 
 if __name__ == "__main__":
     # Keep warnings tidy in console & results.txt
