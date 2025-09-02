@@ -87,7 +87,6 @@ import matplotlib.pyplot as plt
 STACKING_CV: int = 5        # number of CV folds for meta-model training in stacking
 STACKING_PASSTHROUGH: bool = False  # whether to include original features in meta-model input
 
-# 출력, 저장 설정 (main()에서 일괄 관리하므로 여기서는 더 이상 정의하지 않음)
 warnings.filterwarnings("ignore", category=UserWarning) # 사용자 코드에 의해 생성되는 경고 무시
 
 def load_and_explore_data() -> pd.DataFrame:
