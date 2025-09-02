@@ -59,10 +59,10 @@ Notes
 
 from __future__ import annotations
 
-import os
-import sys
 import warnings
 from typing import Iterable, List, Optional, Tuple, Dict, Any
+from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -86,6 +86,9 @@ import matplotlib.pyplot as plt
 # Configurable Stacking parameters
 STACKING_CV: int = 5        # number of CV folds for meta-model training in stacking
 STACKING_PASSTHROUGH: bool = False  # whether to include original features in meta-model input
+
+# 출력, 저장 설정 (main()에서 일괄 관리하므로 여기서는 더 이상 정의하지 않음)
+warnings.filterwarnings("ignore", category=UserWarning) # 사용자 코드에 의해 생성되는 경고 무시
 
 def load_and_explore_data() -> pd.DataFrame:
     """
@@ -170,7 +173,7 @@ def create_multilabel_target(
     n_classes: int = 5,
     new_col: str = "risk_class",
     percentiles: Optional[Iterable[float]] = None,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     Create a multi-class target from a generic risk score = dot(X[risk_features], weights).
     If risk_features/weights are None, a reasonable default is attempted (for Titanic).
@@ -248,7 +251,7 @@ def evaluate_models(
     y_test: np.ndarray,
     direct_model: Optional[BaseEstimator] = None,
     stacked_model: Optional[StackingClassifier] = None,
-) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
     """
     Train a direct baseline model and a stacked ensemble; compute predictions & accuracies.
     If no model instances are provided, uses RandomForestClassifier as direct model and a 
@@ -303,9 +306,9 @@ def plot_roc_auc(
     y: np.ndarray,
     class_names: Optional[List[str]] = None,
     title: str = "ROC Curve",
-    savepath: Optional[str] = None,
+    savepath: Optional[Path] = None,
     show_plot: bool = False,
-) -> Dict[str, float]:
+    ) -> Dict[str, float]:
     """
     Compute ROC curves per class & micro-average. Save figure if savepath provided.
     Return dict of AUCs (per class + micro).
@@ -360,7 +363,7 @@ def plot_roc_auc(
 
 def analyze_feature_importance(
     model: BaseEstimator, feature_names: List[str], top_k: int = 20
-) -> Optional[pd.DataFrame]:
+    ) -> Optional[pd.DataFrame]:
     """
     For tree-based models with feature_importances_, return a DataFrame of top-k importances.
     """
@@ -378,10 +381,9 @@ def analyze_feature_importance_shap(
     model: BaseEstimator,
     X: np.ndarray,
     feature_names: Optional[List[str]] = None,
-    title_prefix: str = "SHAP",
-    savepath_prefix: Optional[str] = None,
+    savepath_prefix: Optional[Path] = None,
     show_plot: bool = False,
-) -> None:
+    ) -> None:
     """
     Try SHAP summary (beeswarm) & bar plot. Save figures if savepath_prefix provided.
     Only saves files; does not display unless show_plot=True.
@@ -440,8 +442,8 @@ def print_result(
     direct_accuracy: float,
     stacked_accuracy: float,
     class_names: Optional[List[str]] = None,
-    file_path: Optional[str] = "output/results.txt",
-) -> None:
+    file_path: Optional[Path] = None,
+    ) -> None:
     """
     Text-only 결과 출력(간소화 버전):
     - Accuracy 및 개선폭
@@ -449,7 +451,7 @@ def print_result(
     - Classification Report (precision/recall/f1)
     화면에 출력하고, 같은 내용을 file_path에도 append 저장.
     """
-    os.makedirs("output", exist_ok=True)
+    p = Path(file_path) if file_path is not None else None
 
     # 라벨 순서 고정(보고서/행열 순서 일치)
     labels = np.unique(y_true)
@@ -499,8 +501,8 @@ def print_result(
     print(text)
 
     # 파일 저장(append)
-    if file_path:
-        with open(file_path, "a", encoding="utf-8") as f:
+    if p:
+        with p.open("a", encoding="utf-8") as f:
             f.write(text + "\n")
 
 def save_results(
@@ -509,30 +511,31 @@ def save_results(
     y_pred_direct: np.ndarray,
     y_pred_stacked: np.ndarray,
     feature_importances: Optional[pd.DataFrame] = None,
-    pred_csv_path: str = "output/stacking_predictions.csv",
-    imp_csv_path: str = "output/feature_importances.csv",
-) -> None:
+    pred_csv_path: Optional[Path] = None,
+    imp_csv_path: Optional[Path] = None,
+    ) -> None:
     """
-    Save predictions and optional feature importances to CSV files under ./output.
+    Save predictions and optional feature importances to CSV files.
     """
-    df_pred = pd.DataFrame({
-        "y_true": y_test,
-        "y_pred_direct": y_pred_direct,
-        "y_pred_stacked": y_pred_stacked,
-    }, index=X_test.index if isinstance(X_test, pd.DataFrame) else None)
-    os.makedirs("output", exist_ok=True)
-    df_pred.to_csv(pred_csv_path, index=True)
+    if pred_csv_path:
+        df_pred = pd.DataFrame({
+            "y_true": y_test,
+            "y_pred_direct": y_pred_direct,
+            "y_pred_stacked": y_pred_stacked,
+        }, index=X_test.index if isinstance(X_test, pd.DataFrame) else None)
+        
+        df_pred.to_csv(Path(pred_csv_path), index=True)
 
-    if feature_importances is not None:
-        feature_importances.to_csv(imp_csv_path, index=False)
+    if feature_importances is not None and imp_csv_path:
+        feature_importances.to_csv(Path(imp_csv_path), index=False)
 
 def print_feature_importance(
     model: BaseEstimator,
     feature_names: List[str],
     top_k: int = 20,
     model_name: str = "Direct Model",
-    file_path: Optional[str] = "output/results.txt",
-) -> Optional[pd.DataFrame]:
+    file_path: Optional[Path] = None,
+    ) -> Optional[pd.DataFrame]:
     """
     Print top-k feature importances for the given model to console and append to results file.
     Returns the DataFrame of importances (or None).
@@ -543,7 +546,7 @@ def print_feature_importance(
         print(header)
         print(imp_df.to_string(index=False))
         if file_path:
-            with open(file_path, "a", encoding="utf-8") as f:
+            with Path(file_path).open("a", encoding="utf-8") as f:
                 f.write(header + "\n")
                 f.write(imp_df.to_string(index=False) + "\n")
     return imp_df
@@ -554,9 +557,9 @@ def print_roc_auc(
     y: np.ndarray,
     class_names: Optional[List[str]] = None,
     title: str = "ROC Curve (Test - Stacked)",
-    savepath: str = "output/roc_curve_test.png",
-    file_path: Optional[str] = "output/results.txt",
-) -> None:
+    savepath: Optional[Path] = None,
+    file_path: Optional[Path] = None,
+    ) -> None:
     """
     Compute ROC AUC using plot_roc_auc and print AUC results to console and file.
     """
@@ -565,23 +568,22 @@ def print_roc_auc(
         auc_round = {k: round(v, 6) for k, v in auc_map.items()}
         print(f"\n[AUC per class + micro] {auc_round}")
         if file_path:
-            with open(file_path, "a", encoding="utf-8") as f:
+            with Path(file_path).open("a", encoding="utf-8") as f:
                 f.write(f"\n[AUC per class + micro] {auc_round}\n")
     except Exception as e:
         msg = f"[WARN] ROC/AUC skipped: {e}"
         print(msg)
         if file_path:
-            with open(file_path, "a", encoding="utf-8") as f:
+            with Path(file_path).open("a", encoding="utf-8") as f:
                 f.write(msg + "\n")
 
 def perform_shap_analysis(
     model: BaseEstimator,
     X: np.ndarray,
     feature_names: Optional[List[str]] = None,
-    title_prefix: str = "SHAP",
-    savepath_prefix: str = "output/shap_test",
-    file_path: Optional[str] = "output/results.txt",
-) -> None:
+    savepath_prefix: Optional[Path] = None,
+    file_path: Optional[Path] = None,
+    ) -> None:
     """
     Run SHAP analysis for the model (using analyze_feature_importance_shap) and log results.
     """
@@ -590,35 +592,48 @@ def perform_shap_analysis(
             model=model,
             X=X,
             feature_names=feature_names,
-            title_prefix=title_prefix,
             savepath_prefix=savepath_prefix,
             show_plot=False,
         )
-        info_msg = f"[INFO] SHAP plots saved: {savepath_prefix}_beeswarm.png, {savepath_prefix}_bar.png"
+        info_msg = (
+            "[INFO] SHAP plots saved: "
+            f"{Path(str(savepath_prefix))}_beeswarm.png, "
+            f"{Path(str(savepath_prefix))}_bar.png"
+        )
         print(info_msg)
         if file_path:
-            with open(file_path, "a", encoding="utf-8") as f:
+            with Path(file_path).open("a", encoding="utf-8") as f:
                 f.write(info_msg + "\n")
     except Exception as e:
         warn_msg = f"[WARN] SHAP analysis skipped: {e}"
         print(warn_msg)
         if file_path:
-            with open(file_path, "a", encoding="utf-8") as f:
+            with Path(file_path).open("a", encoding="utf-8") as f:
                 f.write(warn_msg + "\n")
 
 # --------------------------------------------------------------------------------------
 # Main (project-specific wiring only)
 # --------------------------------------------------------------------------------------
 def main():
-    # Ensure output directory exists
-    os.makedirs("output", exist_ok=True)
 
-    # 1) Load & prepare Titanic data (project-specific pieces)
+    # 1) 출력 디렉토리 및 RUN_ID 설정
+    output_dir = Path("./output_titanic")
+    output_dir.mkdir(exist_ok=True)
+    RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # 2) 모든 저장 경로를 main()에서 일괄 정의
+    results_path = output_dir / f"results_{RUN_ID}.txt"
+    roc_savepath = output_dir / f"roc_curve_test_{RUN_ID}.png"
+    shap_prefix = output_dir / f"shap_test_{RUN_ID}"
+    pred_csv = output_dir / f"stacking_predictions_{RUN_ID}.csv"
+    imp_csv = output_dir / f"feature_importances_{RUN_ID}.csv"
+
+    # 3) Load & prepare Titanic data (project-specific pieces)
     titanic = load_and_explore_data()
     titanic_processed = preprocess_titanic_data(titanic)
     titanic_features = create_features(titanic_processed)
 
-    # 2) Create a generic multi-class target (reusable function)
+    # 4) Create a generic multi-class target (reusable function)
     #    You can customize risk_features/weights per project without code changes.
     default_weights = None  # equal weights by default
     titanic_multilabel, info = create_multilabel_target(
@@ -630,7 +645,7 @@ def main():
         percentiles=None,            # evenly spaced
     )
 
-    # 3) Select features & target
+    # 5) Select features & target
     target_col = "risk_class"  # project-specific choice
     feature_cols = [c for c in titanic_multilabel.columns if c not in {"survived", target_col, "_risk_score"}]
     X = titanic_multilabel[feature_cols].astype(float).values
@@ -641,12 +656,12 @@ def main():
     classes = np.unique(y)
     class_names = [f"class_{int(c)}" for c in classes]
 
-    # 4) Train/test split
+    # 6) Train/test split
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.25, random_state=42, stratify=y
     )
 
-    # 5) Evaluate direct & stacked models
+    # 7) Evaluate direct & stacked models
     results = evaluate_models(
         X_train, X_test, y_train, y_test,
         direct_model=RandomForestClassifier(n_estimators=400, random_state=42)
@@ -659,7 +674,7 @@ def main():
     direct_accuracy = results["direct_accuracy"]
     stacked_accuracy = results["stacked_accuracy"]
 
-    # 6) Print metrics and reports (to console and file)
+    # 8) Print metrics and reports (to console and file)
     print_result(
         y_true=y_test,
         y_pred_direct=y_pred_direct,
@@ -667,47 +682,46 @@ def main():
         direct_accuracy=direct_accuracy,
         stacked_accuracy=stacked_accuracy,
         class_names=class_names,
-        file_path="output/results.txt",
+        file_path=results_path,
     )
 
-    # 7) Feature importance for direct model
-    imp_df = print_feature_importance(direct_model, feature_cols, top_k=25, model_name="Direct Model")
+    # 9) Feature importance for direct model
+    imp_df = print_feature_importance(
+        direct_model, feature_cols, top_k=25, model_name="Direct Model",
+        file_path=results_path,
+    )
 
-    # 8) ROC/AUC for the stacked model (save figure; also print AUC values)
+    # 10) ROC/AUC for the stacked model (save figure; also print AUC values)
     print_roc_auc(
         model=stacked_model,
         X=X_test,
         y=y_test,
         class_names=class_names,
-        title="ROC Curve (Test - Stacked)",
-        savepath="output/roc_curve_test.png",
-        file_path="output/results.txt",
+        savepath=roc_savepath,
+        file_path=results_path,
     )
 
-    # 9) SHAP analysis for stacked model (figures saved to files)
+    # 11) SHAP analysis for stacked model (figures saved to files)
     perform_shap_analysis(
         model=stacked_model,
         X=X_test,
         feature_names=feature_cols,
-        title_prefix="SHAP (Test - Stacked)",
-        savepath_prefix="output/shap_test",
-        file_path="output/results.txt",
+        savepath_prefix=shap_prefix,
+        file_path=results_path,
     )
 
-    # 10) Save predictions & importances to CSV under ./output
+    # 12) Save predictions & importances to CSV under ./output
     save_results(
         X_test=pd.DataFrame(X_test, columns=feature_cols),
         y_test=y_test,
         y_pred_direct=y_pred_direct,
         y_pred_stacked=y_pred_stacked,
         feature_importances=imp_df,
-        pred_csv_path="output/stacking_predictions.csv",
-        imp_csv_path="output/feature_importances.csv",
+        pred_csv_path=pred_csv,
+        imp_csv_path=imp_csv,
     )
 
-    print("\n[INFO] All outputs saved under ./output (no subdirectories).")
+    print(f"\n[INFO] All outputs saved under {output_dir.resolve()} (unique RUN_ID={RUN_ID}).")
 
 if __name__ == "__main__":
-    # Keep warnings tidy in console & results.txt
-    warnings.filterwarnings("ignore")
     main()
