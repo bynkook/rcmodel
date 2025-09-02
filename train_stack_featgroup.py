@@ -1,16 +1,54 @@
 """
-train_stack9.py
+train_stack_featgroup.py
 Scikit-learn StackingRegressor 기반 스태킹 학습 + Optuna 파라미터 탐색 + 그룹화 적용.
+
+추가수정요청사항
+
+1. ML 모델 훈련 코드의 Core Design concept 을 review 하고 불일치 하는 부분을 수정한다.
+- Per-target training with one StackingRegressor per target.
+- Base estimators fit on full X; final estimator is trained by StackingRegressor using OOF
+  (cross_val_predict under the hood) with KFold(n_splits=CV_FOLDS, shuffle=True, random_state).
+- Global, reproducible configuration via constants:
+  TEST_SIZE, RANDOM_STATE, CV_FOLDS.
+
+2. Path, os 모듈로 하위에 output, input 폴더 생성.  파일 저장은 output 폴더에 일관되게 모두 저장함.  input 폴더는 사용자 설정 파일을 불러오는데 사용한다.
+
+3. Optuna Integration method 검토 하고 불일치 하는 부분을 수정한다.
+- USE_OPTUNA=True: runs per-target optimization on the selected preset.
+  - Objective: minimize MAE via KFold CV (CV_FOLDS).
+  - Each trial prints fold-wise MAE and the mean MAE.
+  - USE_OPTUNA=False: loads saved best hyperparameters (JSON) and trains directly (no search). 즉, 사용자가 USE_OPTUNA=False 로 설정할 경우, 코드는 input 폴더에 저장된 사용자가 수동으로 설정한 모델훈련파라메터 json 파일을 load 해서 모델 training 에 사용한다.
+  - N_TRIALS controls the number of Optuna trials when enabled.
+
+4. optuna.pruners 의 MedianPruner 기능 추가, MAE 최소화 기준에 따른 일관된 pruning 작동 -> K-Fold 진행 중 열세한 trial 을 중도 중단시킴
+
+5. StackingRegressor 모델을 생성할때 passthrough=True/False 를 사용자가 수동 지정할 수 있도록 코드를 수정함.
+
+6. 모델 훈련의 best parameter bundle 에도 저장하고, 별도의 json 파일에도 저장한다.  사용자는 모델의 평가가 완료된 후 최종 모델의 훈련을 위해 이 json 파일을 input 폴더로 복사해서 수동으로 모델 훈련 파라메터들을 수정할 수 있다.
+
+7. 모델 훈련 완료 후 bundle 저장은 api.py, index.html 등 외부 코드와 호환성을 유지하기 위해 bundle 에 저장되는 model의 현재 저장 구조를 변경하지 않으며, 또한 bundle 에 저장되는 변수명과 구조를 변경하지 않는다.
+
+8. 기능추가 / 변경 / 코드 오류 fix 작업이 완료된 후, code 의 전체 refactoring 작업을 실시한다.  refactoring 의 최우선 목표는 main() 함수는 작성된 함수를 작업 순서에 따라 호출하고 반환된 값을 사용하여 다른 함수를 호출하는 목적으로 사용하여 main() 함수 내부의 코드는 최대한 심플하게 정리한다.  예를 들어 현재 main() 내부의 홀드아웃 성능 리포트는 별도의 함수를 추가하여 호출할 수 있다.
+
+9. code refactoring 은 코드 내부의 변수(variables) 사용 방법 등 기본적인 코드 작성 규칙들이 정상적으로 작성되어 있는지 확인하는 작업을 포함한다.
+
+10. 수정된 코드 생성시 현재 작성되어 있는 주석 등 사용자의 의도가 반영된 사항들은 삭제, 수정을 최소화 한다. 함수를 설명하는 주석 등이 반드시 수정이 필요한 경우에는 수정한다.
+
+11. 모든 수정작업이 완료된 후, DOCSTRING 을 생성해서 코드 최상단에 추가한다.  DOCSTRING 은 전체 코드 내용을 comprehensive 하게 요약하여 사용자가 미래에 유지관리를 할때 편리하게 도움을 주는 목적으로 작성한다.  DOCSTRING은 최종 수정된 코드의 structure 에 대한 설명을 포함한다.
+
+12. DOCSTRING은 (Train, Validation or Cross-Validation, Test) 작업 과정에서 데이터셋이 어떻게 분할되고, 사용되는지 설명한다.  또한 StackingRegressor 가 OOB 데이터를 이용해서 어떻게 Training 을 하고있는지도 설명한다.
 """
 from __future__ import annotations
 import os
 import sys
+import json
 import warnings
 import joblib
 import numpy as np
-import optuna
+
 import pandas as pd
-from typing import Dict, List, Tuple, Any
+from pathlib import Path
+from typing import Dict, List, Tuple, Any, Optional
 from tqdm.auto import tqdm
 
 from sklearn.base import clone
@@ -23,8 +61,10 @@ from sklearn.preprocessing import RobustScaler, StandardScaler, MinMaxScaler, Fu
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, StackingRegressor
 from sklearn.linear_model import Ridge
 from sklearn import __version__ as sk_version
-from sklearnex import patch_sklearn     # https://pypi.org/project/scikit-learn-intelex/
+from sklearnex import patch_sklearn
 patch_sklearn()
+import optuna
+from optuna.pruners import MedianPruner
 
 pd.set_option("display.max_columns", None)
 pd.set_option("display.width", 200)
@@ -39,8 +79,14 @@ MUT_EXCL   = {'as_provided': ['phi_mn'], 'phi_mn': ['as_provided']}
 
 TEST_SIZE    = 0.2
 RANDOM_STATE = 42
-OUT_BUNDLE   = "stack_bundle.joblib"
-OUT_SCORES   = "stack_scores.csv"
+OUT_BUNDLE   = "stack_group_bundle.joblib"
+OUT_SCORES   = "stack_group_scores.csv"
+
+# 출력,입력 디렉토리 생성
+output_dir = Path('./output')
+output_dir.mkdir(exist_ok=True)
+input_dir = Path('./input')
+input_dir.mkdir(exist_ok=True)
 # =============================================================
 
 
@@ -96,13 +142,7 @@ def build_preprocessor(X: pd.DataFrame) -> ColumnTransformer:
     if cat_cols:
         transformers_.append(("cat", cat_pipe, cat_cols))    
     
-    pre = ColumnTransformer(
-        transformers=transformers_,
-        # remainder="drop",
-        # sparse_threshold=0.0,
-        # verbose_feature_names_out=False,
-    )
-    return pre
+    return ColumnTransformer(transformers=transformers_, remainder="passthrough")
 
 
 def kfold_mae_for_pipeline(pipe: Pipeline, X_df: pd.DataFrame, y: np.ndarray, n_splits: int = 5) -> Tuple[float, List[float]]:
