@@ -1,14 +1,38 @@
 """
 train_stack_featgroup_refactored.py
-date created : 2025.09.02
+date created : 2025.09.03
+
+==========================================================
+Stacked Regression with Feature-Group Specific Training
+==========================================================
+
+This script implements per-target stacked regression models with
+feature-group-aware training, Optuna integration, and API-compatible bundle saving.
 
 Purpose
 -------
-- Train **one StackingRegressor per target** using scikit-learn.
 - Keep API compatibility with the existing FastAPI/index.html by **preserving the bundle schema**.
 - Provide two training modes:
   (A) Optuna-based hyperparameter search (per-target) with pruning and K-Fold CV.
   (B) Fixed-parameter training loaded from JSON (no search), to allow manual adjustment.
+
+Core Design
+-----------
+- One StackingRegressor is trained for each target in COL_TGTS.
+- Base estimators are trained on full X, while the final estimator
+  is trained on out-of-fold (OOF) predictions via cross_val_predict
+  (StackingRegressor built-in), using KFold(CV_FOLDS).
+- Global configuration is controlled via constants:
+  TEST_SIZE, RANDOM_STATE, CV_FOLDS, USE_OPTUNA, etc.
+
+Stacking details (how OOF is used)
+----------------------------------
+- scikit-learn's `StackingRegressor` internally uses `cross_val_predict` on the **training fold** to create
+  out-of-fold (OOF) predictions from base estimators, and fits the **final estimator** on those OOF predictions.
+- Our KFold during objective function is **external** to StackingRegressor's internal CV:
+  - For each outer fold: we fit a fresh pipeline on the **outer train**, and evaluate on the **outer validation**.
+  - Inside that pipeline, StackingRegressor builds its **own internal CV** to generate OOF features for the meta-model.
+- This two-level scheme yields a reliable CV estimate and enables Optuna pruning by fold.
 
 Data split and training flow
 ----------------------------
@@ -23,14 +47,45 @@ Data split and training flow
   4) If Optuna is OFF: load per-target parameters from `input/best_hyperparameters.json` and fit directly on full train.
 - After training, we evaluate on the test split and write a concise **scores CSV**.
 
-Stacking details (how OOF is used)
-----------------------------------
-- scikit-learn's `StackingRegressor` internally uses `cross_val_predict` on the **training fold** to create
-  out-of-fold (OOF) predictions from base estimators, and fits the **final estimator** on those OOF predictions.
-- Our KFold during objective function is **external** to StackingRegressor's internal CV:
-  - For each outer fold: we fit a fresh pipeline on the **outer train**, and evaluate on the **outer validation**.
-  - Inside that pipeline, StackingRegressor builds its **own internal CV** to generate OOF features for the meta-model.
-- This two-level scheme yields a reliable CV estimate and enables Optuna pruning by fold.
+Feature-Group Specific Training
+-------------------------------
+- For selected targets (e.g., 'bd', 'rho', 'phi_mn'), the training set
+  is further split into feature groups defined by ['f_idx', 'width', 'height'].
+- Each group runs an independent Optuna hyperparameter search
+  (with reduced trials if the sample size is small).
+- Group-level best parameters and metrics are collected.
+- **Important:** although multiple groups are tuned,
+  *only the single best-performing group’s model and parameters*
+  are saved into the bundle and JSON.  
+  This ensures API compatibility while still leveraging group-specific search
+  to pick a robust representative model.
+- The final chosen params are stored in `best_params_by_tgt[tgt]`.
+
+Optuna Integration
+------------------
+- USE_OPTUNA=True: runs per-target optimization using KFold CV,
+  objective = MAE minimization.
+- USE_OPTUNA=False: loads previously saved hyperparameters from JSON
+  (in input folder) and trains directly with them.
+- Optuna MedianPruner is enabled to stop underperforming trials early.
+- early stop enabled when 
+
+Bundle Format and API Compatibility
+-----------------------------------
+The bundle saved to joblib retains the same schema expected by api.py:
+
+    {
+        "models": { tgt: sklearn.Pipeline },
+        "features_by_target": { tgt: [features] },
+        "dtypes_by_target": { tgt: {feat: dtype_str} },
+        "targets": [tgt, ...],
+        "best_params_by_target": { tgt: {…} },
+        "sklearn_version": "x.y.z"
+    }
+
+- Only one model per target is stored (string keys, not tuples).
+- Group-specific search is internal; only the chosen best pipeline/params
+  are persisted in the bundle and JSON.
 
 Directories and file outputs
 ----------------------------
@@ -49,37 +104,47 @@ User-configurable knobs
 - `PASSTHROUGH`: Set True/False to control StackingRegressor passthrough behavior.
 - The preprocessing (scalers/transforms) is centralized in `build_preprocessor()` and kept stable.
 
-Bundle schema (unchanged for API/index compatibility)
------------------------------------------------------
-The saved joblib bundle is a dict:
-{
-  "models": { target: sklearn.Pipeline },          # preprocessor + StackingRegressor
-  "features_by_target": { target: [feat, ...] },
-  "dtypes_by_target": { target: {feat: dtype_str} },
-  "targets": [ target, ... ],
-  "best_params_by_target": { target: {param: value, ...} },
-  "sklearn_version": "<x.y.z>"
-}
+File I/O Structure
+------------------
+- All outputs (bundle, reports, params JSON) are stored in the ./output directory.
+- All user-provided or manually edited parameter JSON files are read
+  from the ./input directory.
+
+Workflow Summary
+----------------
+1. Data preparation: select COL_FEAT only
+2. For each target:
+    a. If group-aware → tune params per group, select best, fit final model.
+    b. If not group-aware → tune params on full data, fit final model.
+3. Save reports, params JSON, and API-compatible bundle.
+4. main() only orchestrates calls to modular functions.
 
 Notes
 -----
 - If `USE_OPTUNA=False`, you must provide `input/best_hyperparameters.json` covering **all targets** in `COL_TGTS`.
 - Fold-wise MAE is printed for visibility during search; average MAE is minimized.
+- The feature-group logic improves robustness for targets whose
+  distribution shifts strongly by geometry/material grouping.
+- Bundle schema is fixed to ensure seamless integration with
+  existing api.py and index.html frontends.
 
 """
 
 from __future__ import annotations
 
 import os
+import sys
 import json
+import logging
 import warnings
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional
+from tqdm.auto import tqdm
 
 import joblib
 import numpy as np
-import optuna
 import pandas as pd
+import optuna
 from optuna.pruners import MedianPruner
 from sklearn import __version__ as sk_version
 from sklearn.base import clone
@@ -106,7 +171,7 @@ pd.set_option("display.max_columns", None)
 pd.set_option("display.width", 200)
 warnings.filterwarnings("ignore", category=UserWarning)     # 사용자 코드에서 발생하는 경고 무시
 
-# ========================= 사용자 설정 =========================
+# ========================= 전역 설정 =========================
 # Data / columns
 DATA_CSV = "batch_analysis_rect_result.csv"
 COL_FEAT = ["f_idx", "width", "height", "Sm", "bd", "rho", "phi_mn"]
@@ -126,7 +191,7 @@ USE_PRUNING = True
 PRUNER = MedianPruner(n_startup_trials=5, n_warmup_steps=2, interval_steps=1)
 
 # Stacking passthrough
-PASSTHROUGH = False  # 사용자 지정: True/False
+PASSTHROUGH = False
 
 # I/O directories
 OUT_DIR = Path("./output")
@@ -142,6 +207,23 @@ OUT_PARAMS_JSON = OUT_DIR / "best_hyperparameters_featgroup.json"
 # Inputs (when USE_OPTUNA=False, load this)
 IN_PARAMS_JSON = IN_DIR / "best_hyperparameters_featgroup.json"
 # =============================================================
+
+
+class StopWhenTrialKeepBeingPrunedCallback:
+    # https://optuna.readthedocs.io/en/stable/tutorial/20_recipes/007_optuna_callback.html
+    # Stop optimization after some trials are pruned in a row
+    def __init__(self, threshold: int):
+        self.threshold = threshold
+        self._consequtive_pruned_count = 0
+
+    def __call__(self, study: optuna.study.Study, trial: optuna.trial.FrozenTrial) -> None:
+        if trial.state == optuna.trial.TrialState.PRUNED:
+            self._consequtive_pruned_count += 1
+        else:
+            self._consequtive_pruned_count = 0
+
+        if self._consequtive_pruned_count >= self.threshold:
+            study.stop()
 
 
 def build_feats_by_target(all_feats: List[str], targets: List[str]) -> Dict[str, List[str]]:
@@ -236,11 +318,11 @@ def make_stacking_pipeline(X: pd.DataFrame, params: Dict[str, Any]) -> Pipeline:
     )
 
     base_estimators = [("rf", rf), ("gbr", gbr)]
-    final_est = Ridge(alpha=params.get("ridge_alpha", 1.0))
+    final_estimator = Ridge(alpha=params.get("ridge_alpha", 1.0))
 
     stack = StackingRegressor(
         estimators=base_estimators,
-        final_estimator=final_est,
+        final_estimator=final_estimator,
         cv=KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE),
         n_jobs=-1,
         passthrough=PASSTHROUGH,
@@ -263,8 +345,7 @@ def kfold_mae_for_pipeline(
     y: np.ndarray,
     n_splits: int = CV_FOLDS,
     trial: Optional[optuna.trial.Trial] = None,
-    prune_metric: str = "MAE",
-) -> Tuple[float, List[float]]:
+    ) -> Tuple[float, List[float]]:
     """
     외부 KFold로 파이프라인 MAE를 측정.
     - 각 fold에서 파이프라인(clone) 학습 → 검증 예측 → MAE
@@ -308,7 +389,7 @@ def optuna_objective(trial: optuna.Trial, X_df: pd.DataFrame, y: np.ndarray) -> 
     }
     pipeline = make_stacking_pipeline(X_df, params)
     mean_mae, fold_mae = kfold_mae_for_pipeline(
-        pipeline, X_df, y, n_splits=CV_FOLDS, trial=trial, prune_metric="MAE"
+        pipeline, X_df, y, n_splits=CV_FOLDS, trial=trial,
     )
     print(f"[Trial {trial.number:03d}] MAE per fold: " + ", ".join(f"{m:.6f}" for m in fold_mae))
     print(f"[Trial {trial.number:03d}] Mean MAE    : {mean_mae:.6f}")
@@ -316,20 +397,81 @@ def optuna_objective(trial: optuna.Trial, X_df: pd.DataFrame, y: np.ndarray) -> 
 
 
 def run_optuna_study(X_df: pd.DataFrame, y: np.ndarray, n_trials: int) -> Dict[str, Any]:
-    """Optuna 스터디 실행 후 best_params 반환."""
+    """Optuna 스터디 실행 후 best_params 반환."""    
+    # Add stream handler of stdout to show the messages
+    optuna.logging.get_logger("optuna").addHandler(logging.StreamHandler(sys.stdout))    
+    study_stop_cb = StopWhenTrialKeepBeingPrunedCallback(3)
     pruner = PRUNER if USE_PRUNING else None
+
     study = optuna.create_study(direction="minimize", pruner=pruner)
-    study.optimize(lambda t: optuna_objective(t, X_df, y), n_trials=n_trials, show_progress_bar=True)
+    study.optimize(lambda t: optuna_objective(t, X_df, y), n_trials=n_trials, callbacks=[study_stop_cb], show_progress_bar=True)
     print(f"[Optuna] Best value : {study.best_value:.6f}")
     print(f"[Optuna] Best params: {study.best_params}")
     return study.best_params
 
 
-def fit_target_with_params(X_df: pd.DataFrame, y: np.ndarray, params: Dict[str, Any]) -> Pipeline:
-    """최적 파라미터로 전체 학습 데이터를 사용해 최종 파이프라인 학습."""
-    pipe = make_stacking_pipeline(X_df, params)
-    pipe.fit(X_df, y)
-    return pipe
+def train_per_target_with_optuna(
+    df: pd.DataFrame,
+    targets: List[str],
+    feats_by_tgt: Dict[str, List[str]],
+    best_params_by_tgt: Dict[str, Dict[str, Any]],
+    n_trials: int = 30
+) -> Tuple[Dict[str, Pipeline],
+           Dict[str, Dict[str, str]],
+           Dict[str, Dict[str, Any]]]:
+
+    """타겟별 Optuna → 최적 파라미터로 full train 파이프라인 학습"""
+    models: Dict[str, Pipeline] = {}
+    dtypes_by_tgt: Dict[str, Dict[str, str]] = {}
+
+    for tgt in tqdm(targets, desc="Training models", ncols=100):
+        print(f'\n--- Start training model for target "{tgt}" ---')
+        feats = feats_by_tgt[tgt]
+        X_df = df[feats].copy()
+        y = df[tgt].to_numpy(dtype=float)
+        dtypes_by_tgt[tgt] = X_df.dtypes.astype(str).to_dict()
+
+        if USE_OPTUNA:
+            print(f"\n--- Optuna tuning for target: {tgt} ---")
+            best_params_by_tgt: Dict[str, Dict[str, Any]] = {}
+
+            ##### 그룹화 적용 (bd, rho, phi_mn에만) ####
+            if tgt in ['bd', 'rho', 'phi_mn']:
+                print(f'\n--- Start group training for target "{tgt}", features "{feats}" ---')
+                # group 별 탐색 수행, 그러나 최종 번들에는 대표 모델 1개만 저장
+                group_best_score, group_best_pipe, group_best_params = float("inf"), None, None
+                for group_name, sub_df in df.groupby(['f_idx', 'width', 'height']):
+                    X_group = sub_df[feats].copy()
+                    y_group = sub_df[tgt].to_numpy(dtype=float)
+                    print(f"  Tuning for group: {group_name}")
+                    best_params = run_optuna_study(X_group, y_group, n_trials=n_trials if len(sub_df) > 25 else 10)
+
+                    # 최적 파라미터로 full fit
+                    best_pipe = make_stacking_pipeline(X_group, best_params)
+                    best_pipe.fit(X_group, y_group)
+                    y_hat = best_pipe.predict(X_group)
+                    score = mean_absolute_error(y_group, y_hat)
+                    if score < group_best_score:
+                        group_best_score, group_best_pipe, group_best_params = score, best_pipe, best_params
+
+                # group best 만 저장
+                models[tgt] = group_best_pipe
+                best_params_by_tgt[tgt] = group_best_params
+            else:
+                # Optuna 탐색
+                best_params = run_optuna_study(X_df, y, n_trials=n_trials)
+                best_pipe = make_stacking_pipeline(X_df, best_params)
+                best_pipe.fit(X_df, y)
+                models[tgt] = best_pipe
+                best_params_by_tgt[tgt] = best_params
+        else:
+            best_params = best_params_by_tgt[tgt]
+            print(f"\n--- Using fixed params for target: {tgt} ---")
+            best_pipe = make_stacking_pipeline(X_df, best_params)
+            best_pipe.fit(X_df, y)
+            models[tgt] = best_pipe
+
+    return models, dtypes_by_tgt, best_params_by_tgt
 
 
 def generate_and_save_reports(
@@ -338,7 +480,7 @@ def generate_and_save_reports(
     df_tr: pd.DataFrame,
     df_te: pd.DataFrame,
     out_scores_csv: Path,
-) -> None:
+    ) -> None:
     """Train/Test 평가 리포트 생성 후 CSV 저장."""
     rows: List[Dict[str, Any]] = []
     print("\n--- Final Model Performance (hold-out test) ---")
@@ -371,7 +513,7 @@ def save_bundle(
     dtypes_by_tgt: Dict[str, Dict[str, str]],
     best_params_by_tgt: Dict[str, Dict[str, Any]],
     out_path: Path,
-) -> None:
+    ) -> None:
     """API 호환 번들을 저장."""
     bundle = {
         "models": models,
@@ -394,11 +536,7 @@ def main() -> None:
     feats_by_tgt = build_feats_by_target(COL_FEAT, COL_TGTS)
     df_tr, df_te = train_test_split(df, test_size=TEST_SIZE, random_state=RANDOM_STATE)
 
-    # 3) Train per target
-    models: Dict[str, Pipeline] = {}
-    dtypes_by_tgt: Dict[str, Dict[str, str]] = {}
-    best_params_by_tgt: Dict[str, Dict[str, Any]] = {}
-
+    # 3) load params when USE_OPTUNA = False
     if USE_OPTUNA:
         print("[MODE] Optuna search per target")
     else:
@@ -413,33 +551,24 @@ def main() -> None:
             raise ValueError(f"Input params JSON must include all targets: {COL_TGTS}")
         best_params_by_tgt = loaded
 
-    for tgt in COL_TGTS:
-        feats = feats_by_tgt[tgt]
-        X_tr_tgt = df_tr[feats].copy()
-        y_tr_tgt = df_tr[tgt].to_numpy(dtype=float)
-        dtypes_by_tgt[tgt] = X_tr_tgt.dtypes.astype(str).to_dict()
+    # 4) Train per target
+    models: Dict[str, Pipeline] = {}
+    dtypes_by_tgt: Dict[str, Dict[str, str]] = {}
+    best_params_by_tgt: Dict[str, Dict[str, Any]] = {}
 
-        if USE_OPTUNA:
-            print(f"\n--- Optuna tuning for target: {tgt} ---")
-            best_params = run_optuna_study(X_tr_tgt, y_tr_tgt, n_trials=N_TRIALS)
-            best_params_by_tgt[tgt] = best_params
-        else:
-            best_params = best_params_by_tgt[tgt]
-            print(f"\n--- Using fixed params for target: {tgt} ---")
+    models, dtypes_by_tgt, best_params_by_tgt = train_per_target_with_optuna(
+        df_tr, COL_TGTS, feats_by_tgt, best_params_by_tgt, n_trials=30)
 
-        final_model = fit_target_with_params(X_tr_tgt, y_tr_tgt, best_params)
-        models[tgt] = final_model
-
-    # 4) Persist best params (if Optuna was used)
+    # 5) Persist best params (if Optuna was used)
     if USE_OPTUNA:
         with open(OUT_PARAMS_JSON, "w", encoding="utf-8") as f:
             json.dump(best_params_by_tgt, f, indent=2)
         print(f"[OK] Best hyperparameters saved to: {OUT_PARAMS_JSON}")
 
-    # 5) Save bundle (API-compatible schema)
+    # 6) Save bundle (API-compatible schema)
     save_bundle(models, feats_by_tgt, dtypes_by_tgt, best_params_by_tgt, OUT_BUNDLE)
 
-    # 6) Report hold-out performance
+    # 7) Report hold-out performance
     generate_and_save_reports(models, feats_by_tgt, df_tr, df_te, OUT_SCORES)
 
 
