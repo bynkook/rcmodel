@@ -146,6 +146,7 @@ import numpy as np
 import pandas as pd
 import optuna
 from optuna.pruners import MedianPruner
+from optuna.trial import TrialState  # TrialState 열거형
 from sklearn import __version__ as sk_version
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
@@ -208,6 +209,8 @@ OUT_PARAMS_JSON = OUT_DIR / "best_hyperparameters_featgroup.json"
 IN_PARAMS_JSON = IN_DIR / "best_hyperparameters_featgroup.json"
 # =============================================================
 
+# Add stream handler of stdout to show the messages
+optuna.logging.get_logger("optuna").addHandler(logging.StreamHandler(sys.stdout))
 
 class StopWhenTrialKeepBeingPrunedCallback:
     # https://optuna.readthedocs.io/en/stable/tutorial/20_recipes/007_optuna_callback.html
@@ -224,6 +227,44 @@ class StopWhenTrialKeepBeingPrunedCallback:
 
         if self._consequtive_pruned_count >= self.threshold:
             study.stop()
+
+
+def early_stop_callback(study: optuna.study.Study, trial: optuna.trial.FrozenTrial) -> None:
+    """
+    Optuna 콜백: 조기 종료 조건
+    - 3회 연속으로 trial의 MAE 값이 1e-5 이하인 경우 스터디를 종료.
+    - 3회 연속으로 trial의 MAE 값이 이전 best MAE와의 차이가 1e-5 이하인 경우 스터디를 종료.
+    (이 콜백은 기존 pruning 조건과 독립적으로 동작하며, trial이 pruning되지 않아도 이 조건을 만족하면 종료함)
+    
+    Note: consecutive_small counter only counts "successful" trials.
+    If a trial is pruned, it does NOT reset or increment the counter.
+    """
+    # 최초 호출 시 상태 변수 초기화
+    if not hasattr(early_stop_callback, "consecutive_small"):
+        early_stop_callback.consecutive_small = 0
+        early_stop_callback.consecutive_small_diff = 0
+        early_stop_callback.prev_best = float("inf")
+    # 완료된 trial만 검사 (pruned/failed trial은 조건 연속성 초기화)
+    if trial.state != TrialState.COMPLETE or trial.value is None:
+        early_stop_callback.consecutive_small = 0
+        early_stop_callback.consecutive_small_diff = 0
+        return
+    # 조기 종료 조건 확인
+    value = trial.value
+    if value <= 1e-5:
+        early_stop_callback.consecutive_small += 1
+    else:
+        early_stop_callback.consecutive_small = 0
+    if abs(value - early_stop_callback.prev_best) <= 1e-5:
+        early_stop_callback.consecutive_small_diff += 1
+    else:
+        early_stop_callback.consecutive_small_diff = 0
+    # 조건 만족 시 스터디 중단
+    if early_stop_callback.consecutive_small >= 3 or early_stop_callback.consecutive_small_diff >= 3:
+        study.stop()
+    # 다음 trial을 위한 이전 best MAE 업데이트
+    if value < early_stop_callback.prev_best:
+        early_stop_callback.prev_best = value
 
 
 def build_feats_by_target(all_feats: List[str], targets: List[str]) -> Dict[str, List[str]]:
@@ -397,14 +438,24 @@ def optuna_objective(trial: optuna.Trial, X_df: pd.DataFrame, y: np.ndarray) -> 
 
 
 def run_optuna_study(X_df: pd.DataFrame, y: np.ndarray, n_trials: int) -> Dict[str, Any]:
-    """Optuna 스터디 실행 후 best_params 반환."""    
-    # Add stream handler of stdout to show the messages
-    optuna.logging.get_logger("optuna").addHandler(logging.StreamHandler(sys.stdout))    
+    """Optuna 스터디 실행 후 best_params 반환."""
+    
     study_stop_cb = StopWhenTrialKeepBeingPrunedCallback(3)
     pruner = PRUNER if USE_PRUNING else None
 
     study = optuna.create_study(direction="minimize", pruner=pruner)
-    study.optimize(lambda t: optuna_objective(t, X_df, y), n_trials=n_trials, callbacks=[study_stop_cb], show_progress_bar=True)
+
+    # 초기화: 조기 종료 콜백의 연속 횟수 상태
+    early_stop_callback.consecutive_small = 0
+    early_stop_callback.consecutive_small_diff = 0
+    early_stop_callback.prev_best = float("inf")
+
+    study.optimize(
+        lambda t: optuna_objective(t, X_df, y),
+        n_trials=n_trials,
+        callbacks=[study_stop_cb, early_stop_callback],
+        show_progress_bar=True
+        )
     print(f"[Optuna] Best value : {study.best_value:.6f}")
     print(f"[Optuna] Best params: {study.best_params}")
     return study.best_params
