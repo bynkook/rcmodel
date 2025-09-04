@@ -174,7 +174,7 @@ warnings.filterwarnings("ignore", category=UserWarning)     # 사용자 코드�
 
 # ========================= 전역 설정 =========================
 # Data / columns
-DATA_CSV = "batch_analysis_rect_result.csv"
+DATA_CSV = "batch_analysis_rect_result_small.csv"
 COL_FEAT = ["f_idx", "width", "height", "Sm", "bd", "rho", "phi_mn"]
 COL_TGTS = ["Sm", "bd", "rho", "phi_mn"]
 MUT_EXCL = {"as_provided": ["phi_mn"], "phi_mn": ["as_provided"]}
@@ -190,9 +190,11 @@ USE_OPTUNA = True
 N_TRIALS = 30
 USE_PRUNING = True
 PRUNER = MedianPruner(n_startup_trials=5, n_warmup_steps=2, interval_steps=1)
+# Add stream handler of stdout to show the messages
+optuna.logging.get_logger("optuna").addHandler(logging.StreamHandler(sys.stdout))
 
 # Stacking passthrough
-PASSTHROUGH = False
+PASSTHROUGH = True
 
 # I/O directories
 OUT_DIR = Path("./output")
@@ -209,8 +211,6 @@ OUT_PARAMS_JSON = OUT_DIR / "best_hyperparameters_featgroup.json"
 IN_PARAMS_JSON = IN_DIR / "best_hyperparameters_featgroup.json"
 # =============================================================
 
-# Add stream handler of stdout to show the messages
-optuna.logging.get_logger("optuna").addHandler(logging.StreamHandler(sys.stdout))
 
 class StopWhenTrialKeepBeingPrunedCallback:
     # https://optuna.readthedocs.io/en/stable/tutorial/20_recipes/007_optuna_callback.html
@@ -474,27 +474,31 @@ def train_per_target_with_optuna(
     """타겟별 Optuna → 최적 파라미터로 full train 파이프라인 학습"""
     models: Dict[str, Pipeline] = {}
     dtypes_by_tgt: Dict[str, Dict[str, str]] = {}
+    best_params_by_tgt: Dict[str, Dict[str, Any]] = {}
 
     for tgt in tqdm(targets, desc="Training models", ncols=100):
-        print(f'\n--- Start training model for target "{tgt}" ---')
+        print(f'\n{"="*50}')
+        print(f' Start training model for target ---> "{tgt}"')
+        print(f'{"="*50}')
         feats = feats_by_tgt[tgt]
         X_df = df[feats].copy()
         y = df[tgt].to_numpy(dtype=float)
         dtypes_by_tgt[tgt] = X_df.dtypes.astype(str).to_dict()
-
+        
         if USE_OPTUNA:
             print(f"\n--- Optuna tuning for target: {tgt} ---")
-            best_params_by_tgt: Dict[str, Dict[str, Any]] = {}
-
             ##### 그룹화 적용 (bd, rho, phi_mn에만) ####
             if tgt in ['bd', 'rho', 'phi_mn']:
                 print(f'\n--- Start group training for target "{tgt}", features "{feats}" ---')
                 # group 별 탐색 수행, 그러나 최종 번들에는 대표 모델 1개만 저장
-                group_best_score, group_best_pipe, group_best_params = float("inf"), None, None
+                group_best_score, group_best_params = float("inf"), None
                 for group_name, sub_df in df.groupby(['f_idx', 'width', 'height']):
+                    group_name = np.array(group_name).tolist()
+                    print(f'\n{"="*70}')
+                    print(f"Tuning for group: {group_name}, target: {tgt}")
+                    print(f'{"="*70}\n')
                     X_group = sub_df[feats].copy()
                     y_group = sub_df[tgt].to_numpy(dtype=float)
-                    print(f"  Tuning for group: {group_name}")
                     best_params = run_optuna_study(X_group, y_group, n_trials=n_trials if len(sub_df) > 25 else 10)
 
                     # 최적 파라미터로 full fit
@@ -503,11 +507,14 @@ def train_per_target_with_optuna(
                     y_hat = best_pipe.predict(X_group)
                     score = mean_absolute_error(y_group, y_hat)
                     if score < group_best_score:
-                        group_best_score, group_best_pipe, group_best_params = score, best_pipe, best_params
+                        group_best_score, group_best_params = score, best_params
 
                 # group best 만 저장
-                models[tgt] = group_best_pipe
+                print(f'\n--- Best group for "{tgt}" had MAE {group_best_score:.6f}. Training final model. ---')
                 best_params_by_tgt[tgt] = group_best_params
+                best_pipe = make_stacking_pipeline(X_df, group_best_params)
+                best_pipe.fit(X_df, y)
+                models[tgt] = best_pipe
             else:
                 # Optuna 탐색
                 best_params = run_optuna_study(X_df, y, n_trials=n_trials)
@@ -516,8 +523,8 @@ def train_per_target_with_optuna(
                 models[tgt] = best_pipe
                 best_params_by_tgt[tgt] = best_params
         else:
-            best_params = best_params_by_tgt[tgt]
             print(f"\n--- Using fixed params for target: {tgt} ---")
+            best_params = best_params_by_tgt[tgt]
             best_pipe = make_stacking_pipeline(X_df, best_params)
             best_pipe.fit(X_df, y)
             models[tgt] = best_pipe
