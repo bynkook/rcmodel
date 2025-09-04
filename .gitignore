@@ -1,6 +1,10 @@
 # BK ADDED
 backup/
 output/
+output_*/
+*.csv
+*.png
+*.txt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
