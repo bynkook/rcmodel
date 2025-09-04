@@ -463,7 +463,7 @@ def train_per_target_with_optuna(
     feats_by_tgt: Dict[str, List[str]],
     storage_url: str,
     n_trials: int
-) -> Tuple[Dict[str, Pipeline], Dict[str, Dict[str, str]], Dict[str, Dict[str, Any]], List[str]]:
+) -> Tuple[Dict[str, Pipeline], Dict[str, Dict[str, str]], Dict[str, Dict[str, Any]]]:
     """
     Handles the main training loop, including group-specific logic.
     Delegates Optuna study execution to `run_optuna_study`.
@@ -472,7 +472,6 @@ def train_per_target_with_optuna(
     models: Dict[str, Pipeline] = {}
     dtypes_by_tgt: Dict[str, Dict[str, str]] = {}
     best_params_by_tgt: Dict[str, Dict[str, Any]] = {}
-    all_study_names: List[str] = []
 
     for tgt in tqdm(targets, desc="Training models", ncols=100):
         print(f'\n{"="*50}')
@@ -490,7 +489,6 @@ def train_per_target_with_optuna(
             for group_name, sub_df in df.groupby(['f_idx', 'width', 'height']):
                 group_id_str = "_".join(map(str, group_name))
                 study_name = f"{tgt}_group_{group_id_str}"
-                all_study_names.append(study_name)               
                 group_name = np.array(group_name).tolist()
                 print(f'\n{"="*70}')
                 print(f"Tuning for group: {group_name}, target: {tgt}")
@@ -498,8 +496,7 @@ def train_per_target_with_optuna(
                 X_group = sub_df[feats].copy()
                 y_group = sub_df[tgt].to_numpy(dtype=float)
                
-                n_trials_group = n_trials if len(sub_df) > 25 else 10
-                best_params = run_optuna_study(X_group, y_group, study_name, storage_url, n_trials_group)
+                best_params = run_optuna_study(X_group, y_group, study_name, storage_url, n_trials)
                
                 # Evaluate this group's best params on its own data to find the overall best group
                 pipe = make_stacking_pipeline(X_group, best_params)
@@ -517,16 +514,15 @@ def train_per_target_with_optuna(
             models[tgt] = best_pipe
         else:
             study_name = f"{tgt}_study"
-            all_study_names.append(study_name)
-
             best_params = run_optuna_study(X_df_full, y_full, study_name, storage_url, n_trials)
+
             best_params_by_tgt[tgt] = best_params
            
             best_pipe = make_stacking_pipeline(X_df_full, best_params)
             best_pipe.fit(X_df_full, y_full)
             models[tgt] = best_pipe
 
-    return models, dtypes_by_tgt, best_params_by_tgt, all_study_names
+    return models, dtypes_by_tgt, best_params_by_tgt
 
 
 def generate_and_save_reports(
@@ -582,14 +578,26 @@ def save_bundle(
     print(f"[OK] Bundle saved to: {out_path}")
 
 
-def generate_all_visualizations(study_names: List[str], storage_url: str, out_dir: Path):
+def generate_all_visualizations(storage_url: str, out_dir: Path):
     """
-    Loads completed studies from storage and generates all relevant visualization plots,
-    saving them as HTML files.
+    Loads ALL studies directly from storage and generates visualization plots,
+    saving them as HTML files. This is robust to script restarts.
     """
     print("\n--- Generating Optuna Visualizations ---")
-    if not study_names:
-        print("WARNING: No study names provided for visualization. Skipping.")
+    
+    try:
+        # DB에 저장된 모든 study의 요약 정보를 가져옵니다.
+        all_studies = optuna.get_all_study_summaries(storage=storage_url)
+        if not all_studies:
+            print("WARNING: No studies found in storage. Skipping visualization.")
+            return
+        
+        # 요약 정보에서 study 이름만 추출합니다.
+        study_names = [s.study_name for s in all_studies]
+        print(f"Found {len(study_names)} studies in the database to visualize.")
+
+    except Exception as e:
+        print(f"CRITICAL ERROR: Failed to fetch studies from database at '{storage_url}'. Error: {e}")
         return
 
     for study_name in tqdm(study_names, desc="Generating Plots", ncols=100):
@@ -611,16 +619,15 @@ def generate_all_visualizations(study_names: List[str], storage_url: str, out_di
             except (ValueError, RuntimeError) as e:
                 print(f"Could not plot importances for {study_name}: {e}")
 
-
             # 3. Slice Plot
             fig = plot_slice(study)
             fig.write_html(study_viz_dir / "slice.html")
 
             # 4. Contour Plot for top 2 params
             try:
-                trials_df = study.trials_dataframe(attrs=("params", "state"))
-                completed_params = trials_df.loc[trials_df.state == "COMPLETE", "params"]
-                if not completed_params.empty and len(completed_params.iloc[0]) >= 2:
+                # Ensure there are completed trials with at least 2 parameters
+                completed_trials = [t for t in study.trials if t.state == TrialState.COMPLETE and len(t.params) >= 2]
+                if completed_trials:
                     top_params = [p for p, _ in optuna.importance.get_param_importances(study).items()][:2]
                     if len(top_params) == 2:
                          fig = plot_contour(study, params=top_params)
@@ -632,9 +639,8 @@ def generate_all_visualizations(study_names: List[str], storage_url: str, out_di
             fig = plot_intermediate_values(study)
             fig.write_html(study_viz_dir / "intermediate_values.html")
 
-        except KeyError:
-            print(f"WARNING: Study '{study_name}' not found in storage. Skipping visualization.")
         except Exception as e:
+            # Changed from KeyError to generic Exception for broader safety
             print(f"ERROR: Failed to generate visualizations for '{study_name}': {e}")
            
     print(f"[OK] All visualizations saved to: {out_dir}")
@@ -649,12 +655,9 @@ def main() -> None:
     feats_by_tgt = build_feats_by_target(COL_FEAT, COL_TGTS)
     df_tr, df_te = train_test_split(df, test_size=TEST_SIZE, random_state=RANDOM_STATE)
 
-    best_params_by_tgt = {}
-    all_study_names_for_viz = []
-
     if USE_OPTUNA:
         print(f"[MODE] Optuna search with persistent storage: {STORAGE_URL}")
-        models, dtypes_by_tgt, best_params_by_tgt, all_study_names_for_viz = train_per_target_with_optuna(
+        models, dtypes_by_tgt, best_params_by_tgt = train_per_target_with_optuna(
             df_tr, COL_TGTS, feats_by_tgt, STORAGE_URL, n_trials=N_TRIALS
         )
     else:
@@ -688,8 +691,8 @@ def main() -> None:
     generate_and_save_reports(models, feats_by_tgt, df_tr, df_te, OUT_SCORES)
 
     # 8) Generate and save all visualizations
-    if USE_OPTUNA and all_study_names_for_viz:
-        generate_all_visualizations(all_study_names_for_viz, STORAGE_URL, VIZ_DIR)
+    if USE_OPTUNA:
+        generate_all_visualizations(STORAGE_URL, VIZ_DIR)
 
 
 if __name__ == "__main__":
