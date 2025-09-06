@@ -433,14 +433,18 @@ def run_optuna_study(
     # If the study is new, save the intended number of trials as an attribute.
     if len(study.trials) == 0:
         study.set_user_attr("goal_n_trials", n_trials)
-    
+
     goal_n_trials = study.user_attrs.get("goal_n_trials", n_trials)
 
-    completed_trials = len([t for t in study.trials if t.state in (TrialState.COMPLETE, TrialState.PRUNED)])
-    print(f"INFO: Study [{study_name}] - Found {completed_trials} completed trials out of {goal_n_trials}.")
+    # Resume 판단은 COMPLETE + PRUNED 기준(FAIL 제외)
+    completed_trials = len([t for t in study.trials
+                            if t.state in (TrialState.COMPLETE, TrialState.PRUNED)])
+    remaining = max(0, int(goal_n_trials) - int(completed_trials))
+    print(f"INFO: Study [{study_name}] - Found {completed_trials} completed trials "
+          f"(target={goal_n_trials}, remaining={remaining}).")
 
-    if completed_trials < goal_n_trials:
-        print(f"INFO: Study [{study_name}] - Running/resuming optimization...")
+    if remaining > 0:
+        print(f"INFO: Study [{study_name}] - Running/resuming optimization for {remaining} more trials...")
         study_stop_cb = StopWhenTrialKeepBeingPrunedCallback(3)
         # reset early-stop callback state
         early_stop_callback.consecutive_small = 0
@@ -449,17 +453,19 @@ def run_optuna_study(
        
         study.optimize(
             lambda t: optuna_objective(t, X_df, y),
-            n_trials=n_trials,
+            n_trials=remaining,
             callbacks=[study_stop_cb, early_stop_callback],
             show_progress_bar=True
         )
     else:
         print(f"INFO: Study [{study_name}] - Study is already complete. Skipping.")
 
-    # This marks early-stopped studies as "complete" for the next run.
-    final_completed_trials = len([t for t in study.trials if t.state in (TrialState.COMPLETE, TrialState.PRUNED)])
+    # 조기 종료된 경우에도 현재까지 완료치 기록 유지
+    # 다음 새 스터디는 최초 생성 시 다시 전역 n_trials로 시작(스코프 분리)
+    final_completed_trials = len([t for t in study.trials
+                                  if t.state in (TrialState.COMPLETE, TrialState.PRUNED)])
     if final_completed_trials < goal_n_trials:
-        print(f"INFO: Study [{study_name}] was stopped early. Updating goal to {final_completed_trials}.")
+        print(f"INFO: Study [{study_name}] early-stopped at {final_completed_trials}/{goal_n_trials}.")
         study.set_user_attr("goal_n_trials", final_completed_trials)
 
     print(f"[Optuna] Best value for {study_name}: {study.best_value:.6f}")
