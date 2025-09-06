@@ -149,7 +149,7 @@ warnings.filterwarnings("ignore", category=UserWarning)     # 사용자 코드�
 
 # ========================= 전역 설정 =========================
 # Data / columns
-DATA_CSV = "batch_analysis_rect_result_small.csv"
+DATA_CSV = "batch_analysis_rect_result.csv"
 COL_FEAT = ["f_idx", "width", "height", "Sm", "bd", "rho", "phi_mn"]
 COL_TGTS = ["Sm", "bd", "rho", "phi_mn"]
 MUT_EXCL = {"as_provided": ["phi_mn"], "phi_mn": ["as_provided"]}
@@ -164,17 +164,13 @@ USE_OPTUNA = True
 # USE_OPTUNA = False
 N_TRIALS = 30
 USE_PRUNING = True
-# Pruner for optuna trial
-PRUNER = MedianPruner(n_startup_trials=5, n_warmup_steps=2, interval_steps=1)
-# Stream handler of stdout to show the messages
-optuna.logging.get_logger("optuna").addHandler(logging.StreamHandler(sys.stdout))
 
 # Stacking passthrough
 PASSTHROUGH = True
 
 # I/O directories
-OUT_DIR = Path("./output")
-IN_DIR = Path("./input")
+OUT_DIR = Path("./output_featgroup")
+IN_DIR = Path("./input_featgroup")
 VIZ_DIR = OUT_DIR / "visualizations"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 IN_DIR.mkdir(parents=True, exist_ok=True)
@@ -188,7 +184,8 @@ OUT_PARAMS_JSON = OUT_DIR / "best_hyperparameters_featgroup.json"
 # Inputs (when USE_OPTUNA=False, load this)
 IN_PARAMS_JSON = IN_DIR / "best_hyperparameters_featgroup.json"
 # Optuna Storage (for Resume and History features)
-STORAGE_URL = f"sqlite:///{OUT_DIR / 'optuna_study.db'}"
+# timeout: wait for file lock
+STORAGE_URL = f"sqlite:///{OUT_DIR / 'optuna_study.db'}?timeout=60"
 # =============================================================
 
 
@@ -430,15 +427,22 @@ def run_optuna_study(
         storage=storage_url,
         load_if_exists=True,
         direction="minimize",
-        pruner=PRUNER if USE_PRUNING else None,
+        pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=2, interval_steps=1) if USE_PRUNING else None,
     )
 
-    completed_trials = len([t for t in study.trials if t.state == TrialState.COMPLETE])
-    print(f"INFO: Study [{study_name}] - Found {completed_trials} completed trials out of {n_trials}.")
+    # If the study is new, save the intended number of trials as an attribute.
+    if len(study.trials) == 0:
+        study.set_user_attr("goal_n_trials", n_trials)
+    
+    goal_n_trials = study.user_attrs.get("goal_n_trials", n_trials)
 
-    if completed_trials < n_trials:
+    completed_trials = len([t for t in study.trials if t.state in (TrialState.COMPLETE, TrialState.PRUNED)])
+    print(f"INFO: Study [{study_name}] - Found {completed_trials} completed trials out of {goal_n_trials}.")
+
+    if completed_trials < goal_n_trials:
         print(f"INFO: Study [{study_name}] - Running/resuming optimization...")
         study_stop_cb = StopWhenTrialKeepBeingPrunedCallback(3)
+        # reset early-stop callback state
         early_stop_callback.consecutive_small = 0
         early_stop_callback.consecutive_small_diff = 0
         early_stop_callback.prev_best = float("inf")
@@ -451,6 +455,12 @@ def run_optuna_study(
         )
     else:
         print(f"INFO: Study [{study_name}] - Study is already complete. Skipping.")
+
+    # This marks early-stopped studies as "complete" for the next run.
+    final_completed_trials = len([t for t in study.trials if t.state in (TrialState.COMPLETE, TrialState.PRUNED)])
+    if final_completed_trials < goal_n_trials:
+        print(f"INFO: Study [{study_name}] was stopped early. Updating goal to {final_completed_trials}.")
+        study.set_user_attr("goal_n_trials", final_completed_trials)
 
     print(f"[Optuna] Best value for {study_name}: {study.best_value:.6f}")
     print(f"[Optuna] Best params for {study_name}: {study.best_params}")
@@ -515,9 +525,7 @@ def train_per_target_with_optuna(
         else:
             study_name = f"{tgt}_study"
             best_params = run_optuna_study(X_df_full, y_full, study_name, storage_url, n_trials)
-
-            best_params_by_tgt[tgt] = best_params
-           
+            best_params_by_tgt[tgt] = best_params           
             best_pipe = make_stacking_pipeline(X_df_full, best_params)
             best_pipe.fit(X_df_full, y_full)
             models[tgt] = best_pipe
@@ -566,6 +574,7 @@ def save_bundle(
     out_path: Path,
     ) -> None:
     """API 호환 번들을 저장."""
+
     bundle = {
         "models": models,
         "features_by_target": feats_by_tgt,
@@ -656,6 +665,11 @@ def main() -> None:
     df_tr, df_te = train_test_split(df, test_size=TEST_SIZE, random_state=RANDOM_STATE)
 
     if USE_OPTUNA:
+        # Stream handler of stdout to show the messages (add once)
+        _optuna_logger = optuna.logging.get_logger("optuna")
+        if not any(isinstance(h, logging.StreamHandler) for h in _optuna_logger.handlers):
+            _optuna_logger.addHandler(logging.StreamHandler(sys.stdout))
+
         print(f"[MODE] Optuna search with persistent storage: {STORAGE_URL}")
         models, dtypes_by_tgt, best_params_by_tgt = train_per_target_with_optuna(
             df_tr, COL_TGTS, feats_by_tgt, STORAGE_URL, n_trials=N_TRIALS
