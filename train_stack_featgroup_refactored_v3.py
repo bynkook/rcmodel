@@ -656,7 +656,8 @@ def train_per_target_with_optuna(
                     _, best_params = run_optuna_study(X_df_full, y_full, study_name, storage_url, remaining)
                 else:
                     _st = optuna.load_study(study_name=study_name, storage=storage_url)
-                    best_value, best_params = float(_st.best_value), _st.best_params
+                    # best_value, best_params = float(_st.best_value), _st.best_params
+                    best_params = _st.best_params
             best_params_by_tgt[tgt] = best_params
             best_pipe = make_stacking_pipeline(X_df_full, best_params)
             best_pipe.fit(X_df_full, y_full)
