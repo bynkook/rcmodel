@@ -501,7 +501,7 @@ def train_per_target_with_optuna(
 
         if tgt in ['bd', 'rho', 'phi_mn']:
             print(f'\n--- Start group training for target "{tgt}", features "{feats}" ---')
-            group_best_score, group_best_params = float("inf"), None #######################
+            group_best_score, group_best_params = float("inf"), None    # 중요 : 타겟별 group study 의 최고점수만 저장함
                        
             for group_name, sub_df in df.groupby(['f_idx', 'width', 'height']):
                 group_id_str = "_".join(map(str, group_name))
@@ -517,14 +517,12 @@ def train_per_target_with_optuna(
                             cand_params = _st.best_params
                             cand_score  = float(_st.best_value)
                             if cand_score < group_best_score:
-                                group_best_score, group_best_params = cand_score, cand_params
-                            # 다음 그룹으로
-                            continue
+                                group_best_score, group_best_params = cand_score, cand_params                            
+                            continue    # 다음 그룹으로
                         except Exception as e:
-                            print(f"WARNING: Failed to load best from cached study [{study_name}]: {e}")
-                            # 실패 시에는 평소대로 열어서 처리
+                            print(f"WARNING: Failed to load best from cached study [{study_name}]: {e}")    # 실패 시에는 평소대로 열어서 처리
                     else:
-                        # 캐시에 없으면 추적 로그(1회 1줄)
+                        # 캐시에 없으면 로드
                         print(f"INFO: Not in cache → will open study: {study_name}")
 
                 group_name = np.array(group_name).tolist()
