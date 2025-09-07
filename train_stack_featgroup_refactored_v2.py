@@ -106,7 +106,7 @@ import json
 import logging
 import warnings
 from pathlib import Path
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any, Optional, Set
 from tqdm.auto import tqdm
 
 import joblib
@@ -478,7 +478,8 @@ def train_per_target_with_optuna(
     targets: List[str],
     feats_by_tgt: Dict[str, List[str]],
     storage_url: str,
-    n_trials: int
+    n_trials: int,
+    completed_studies: Optional[Set[str]] = None,
 ) -> Tuple[Dict[str, Pipeline], Dict[str, Dict[str, str]], Dict[str, Dict[str, Any]]]:
     """
     Handles the main training loop, including group-specific logic.
@@ -500,11 +501,32 @@ def train_per_target_with_optuna(
 
         if tgt in ['bd', 'rho', 'phi_mn']:
             print(f'\n--- Start group training for target "{tgt}", features "{feats}" ---')
-            group_best_score, group_best_params = float("inf"), None
+            group_best_score, group_best_params = float("inf"), None #######################
                        
             for group_name, sub_df in df.groupby(['f_idx', 'width', 'height']):
                 group_id_str = "_".join(map(str, group_name))
                 study_name = f"{tgt}_group_{group_id_str}"
+
+                # 이미 완료된 스터디면 DB를 열지 말고 즉시 스킵
+                if completed_studies is not None:
+                    if study_name in completed_studies:
+                        print(f"INFO: Skip completed study (cached): {study_name}")
+                        # 캐시 스킵 시에도 DB에서 best를 즉시 가져와 후보에 반영
+                        try:
+                            _st = optuna.load_study(study_name=study_name, storage=STORAGE_URL)
+                            cand_params = _st.best_params
+                            cand_score  = float(_st.best_value)
+                            if cand_score < group_best_score:
+                                group_best_score, group_best_params = cand_score, cand_params
+                            # 다음 그룹으로
+                            continue
+                        except Exception as e:
+                            print(f"WARNING: Failed to load best from cached study [{study_name}]: {e}")
+                            # 실패 시에는 평소대로 열어서 처리
+                    else:
+                        # 캐시에 없으면 추적 로그(1회 1줄)
+                        print(f"INFO: Not in cache → will open study: {study_name}")
+
                 group_name = np.array(group_name).tolist()
                 print(f'\n{"="*70}')
                 print(f"Tuning for group: {group_name}, target: {tgt}")
@@ -523,15 +545,38 @@ def train_per_target_with_optuna(
                     group_best_score = score
                     group_best_params = best_params
 
-            print(f'\n--- Best group for "{tgt}" had MAE {group_best_score:.6f}. Training final model. ---')
+            # 그룹 튠 결과 집계
+            if group_best_params is None or not np.isfinite(group_best_score):
+                print(f'\n--- Best group for "{tgt}" had MAE {group_best_score}. Training final model. ---')
+                # 안전장치: 그래도 None이면 현재 타깃용 기본 파라미터로 fall-back(이 경우는 거의 캐시/DB 로드 오류일 때만 발생)
+                if group_best_params is None:
+                    try:
+                        _st_fallback = optuna.load_study(
+                            study_name=f"{tgt}_study", storage=storage_url
+                        )
+                        group_best_params = _st_fallback.best_params
+                    except Exception as e:
+                        raise RuntimeError(
+                            f'No best params resolved for grouped target "{tgt}". '
+                            f'Check cache/DB: {e}'
+                        )
             best_params_by_tgt[tgt] = group_best_params
             best_pipe = make_stacking_pipeline(X_df_full, group_best_params)
             best_pipe.fit(X_df_full, y_full)
             models[tgt] = best_pipe
         else:
             study_name = f"{tgt}_study"
-            best_params = run_optuna_study(X_df_full, y_full, study_name, storage_url, n_trials)
-            best_params_by_tgt[tgt] = best_params           
+            # 이미 완료된 study 는 db를 열지 않고 skip
+            if completed_studies is not None and study_name in completed_studies:
+                print(f"INFO: Skip completed study (cached): {study_name}")
+                # 캐시된 스터디의 best를 DB에서 로드하여 곧바로 학습에 사용
+                _st = optuna.load_study(study_name=study_name, storage=storage_url)
+                best_params = _st.best_params
+            else:
+                if completed_studies is not None:
+                    print(f"INFO: Not in cache → will open study: {study_name}")
+                best_params = run_optuna_study(X_df_full, y_full, study_name, storage_url, n_trials)
+            best_params_by_tgt[tgt] = best_params
             best_pipe = make_stacking_pipeline(X_df_full, best_params)
             best_pipe.fit(X_df_full, y_full)
             models[tgt] = best_pipe
@@ -677,9 +722,29 @@ def main() -> None:
             _optuna_logger.addHandler(logging.StreamHandler(sys.stdout))
 
         print(f"[MODE] Optuna search with persistent storage: {STORAGE_URL}")
+
+        # SQLite에서 모든 스터디 요약을 한 번에 조회 후,
+        # n_trials >= N_TRIALS 인 스터디명을 캐시에 담아 빠른 스킵
+        try:
+            summaries = optuna.get_all_study_summaries(storage=STORAGE_URL)
+            # Track completed studies more accurately:
+            # A study is considered "completed" if it has at least one COMPLETE trial
+            # (ignores PRUNED/FAIL). This avoids skipping studies that stopped early.
+            completed_names: Set[str] = set()
+            for summary in summaries:
+                study = optuna.load_study(study_name=summary.study_name, storage=STORAGE_URL)
+                n_complete = len([t for t in study.trials if t.state == TrialState.COMPLETE])
+                if n_complete > 0:
+                    completed_names.add(summary.study_name)
+                print(f"INFO: Counting cached completed studies (count={len(completed_names)}).")
+        except Exception as e:
+            print(f"WARNING: Failed to prefetch study summaries. Fallback to per-study open. Error: {e}")
+            completed_names = set()
+
         models, dtypes_by_tgt, best_params_by_tgt = train_per_target_with_optuna(
-            df_tr, COL_TGTS, feats_by_tgt, STORAGE_URL, n_trials=N_TRIALS
-        )
+            df_tr, COL_TGTS, feats_by_tgt, STORAGE_URL, n_trials=N_TRIALS,
+            completed_studies=completed_names
+         )
     else:
         print("[MODE] Fixed-parameter training from input JSON")
         if not IN_PARAMS_JSON.exists():
