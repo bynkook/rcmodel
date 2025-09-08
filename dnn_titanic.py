@@ -1,7 +1,9 @@
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import roc_curve, roc_auc_score
 import tensorflow as tf
 import random
 import re  # For title extraction
@@ -216,7 +218,6 @@ print("F1 Score:", f1_score(y_test, y_pred))
 print("Classification Report", classification_report(y_test, y_pred))
 
 # Visualization
-import matplotlib.pyplot as plt
 def plot_training_history(history):
     plt.figure(figsize=(12, 5))
     plt.subplot(1, 2, 1)
@@ -245,7 +246,25 @@ def plot_training_history(history):
     plt.tight_layout()
     plt.show()
 
+def plot_roc_curve(y_test, y_pred_proba_pos):
+   fpr, tpr, thresholds = roc_curve(y_test, y_pred_proba_pos)
+   plt.plot(fpr, tpr, label=f'ROC curve (AUC = {auc_score:.2f})')
+   plt.plot([0, 1], [0, 1], 'k--', label='Classifier') # Diagonal line
+   plt.xlabel('False Positive Rate')
+   plt.ylabel('True Positive Rate')
+   plt.title('Receiver Operating Characteristic (ROC) Curve')
+   plt.legend(loc='lower right')
+   plt.show()
+
 plot_training_history(history)
+
+# plot ROC curve
+plot_roc_curve(y_test, model.predict_proba(X_test)[:,1])
+
+# print AUC score
+auc_score = roc_auc_score(y_test, model.predict_proba(X_test)[:,1])
+print(f"AUC Score: {auc_score:.2f}")
+
 
 ###### 모델 성능 점수 향상을 위한 새로운 모델 작성 ######
 ### Imbalance Handling with SMOTE
