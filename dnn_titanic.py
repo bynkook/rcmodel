@@ -1,159 +1,197 @@
+"""
+dnn_titanic.py
+==============
+
+개요
+----
+이 스크립트는 **seaborn 형식의 Titanic 데이터셋(`titanic.csv`)**을 이용해
+간단한 **DNN(다층퍼셉트론, MLP)** 분류 모델을 학습·평가하는 예제입니다.
+학습 목적의 코드로서 **노트북 스타일(line-by-line)** 로 전처리 → 분할 → 스케일링 → 모델 학습 → 평가 순으로
+직관적으로 작성되어 있으며, 별도의 전처리 함수는 사용하지 않습니다.
+
+데이터셋
+--------
+입력 파일: `titanic.csv` (seaborn 제공 스키마와 동일한 컬럼 구성 가정)
+주요 컬럼 예:
+- 타깃: `survived` (0/1)
+- 숫자형: `pclass`, `age`, `sibsp`, `parch`, `fare`
+- 범주형/불리언: `sex`, `embarked`, `deck`, `who`, `adult_male`, `embark_town`, `alone`, `class`, `alive` 등
+
+데이터 전처리 (현재 코드에 맞춤)
+-------------------------------
+- **컬럼 정리**
+  - 타깃 누수 방지: `alive`(문자형 생존 여부)는 `survived`와 동치이므로 제거
+  - 중복 의미 축소: `class`(텍스트) 대신 `pclass`(정수) 사용
+- **파생 변수**
+  - `family_size = sibsp + parch + 1`
+  - `is_alone` = `alone`(bool)을 `int`로 변환(없으면 `family_size==1`로 대체 산출)
+  - `fare_per_person = fare / family_size` (무한대/결측은 0 또는 중앙값으로 치환)
+- **결측치 처리**
+  - 숫자형(`age`, `fare`, `fare_per_person`)은 **중앙값**으로 대체
+  - 범주형(`embarked`, `who`, `embark_town`)은 **최빈값**으로 대체
+  - `deck`은 결측을 **별도 범주 'M'** 로 두고, 갑판을 그룹화(예: A/B/C→'ABC', D/E→'DE', F/G→'FG', M 유지)
+- **인코딩**
+  - 범주형: `sex`, `embarked`, `deck`, `who`, `pclass` 등을 **원-핫 인코딩**(`pd.get_dummies`, `drop_first=True`)
+  - 불리언: `adult_male`, `alone` 등은 사용 시 `int`로 변환
+- **스케일링**
+  - 숫자 피처는 **RobustScaler**를 사용하여 이상치 영향 완화
+
+데이터 분할 및 검증/평가 (현재 코드의 기본 흐름)
+---------------------------------------------
+- **Train/Test 분할**: `train_test_split(..., test_size=0.2, stratify=y, random_state=42)`
+- **검증 방법**:
+  - 현재 코드는 예시로 `model.fit(..., validation_data=(X_test, y_test))` 형태를 포함할 수 있습니다.
+  - 이는 **테스트 세트를 학습 중 모니터링에 사용**한다는 의미로, 엄밀한 일반화 성능 보고에는 적절하지 않습니다.
+  - 실전에서는 `validation_split=...` 또는 별도의 `(X_val, y_val)` 분리를 권장하며,
+    **최종 Test 평가는 학습·튜닝에 전혀 쓰지 않은 세트**로 수행해야 합니다.
+
+모델 구성 (DNN/MLP)
+-------------------
+- 프레임워크: **TensorFlow 2.x (tf.keras 공개 API)** 사용
+  - 내부 모듈 경로(`tensorflow.python.keras...`)가 아닌 **공개 경로(`tensorflow.keras`)** 를 사용해야
+    버전 호환성 문제(예: `DistributedDatasetInterface` AttributeError)를 피할 수 있습니다.
+- 구조: `Sequential` + `Dense`(필요 시 `Dropout`)
+  - 입력 차원: 전처리 후 피처 수
+  - 은닉층/유닛/활성화/드롭아웃 비율은 실험용으로 단순 구성
+  - 이진 분류의 경우 출력층은 `Dense(1, activation='sigmoid')` 를 사용(모델의 `predict`가 양성 확률로 해석 가능)
+
+학습 설정
+---------
+- 콜백: `EarlyStopping`, `ModelCheckpoint` (필요 시 사용)
+- 손실/평가지표: 이진 분류 환경에 맞는 손실(`binary_crossentropy`) 및 지표(예: `accuracy`)
+
+평가 및 ROC-AUC
+---------------
+- 예측 확률: Keras 분류 모델은 **`predict_proba`가 아닌 `model.predict`** 를 사용합니다.
+  - 이진 분류(`sigmoid`)에서는 `model.predict(X).ravel()` 이 **양성(1) 확률**로 해석됩니다.
+- ROC-AUC: `sklearn.metrics.roc_auc_score(y_true, y_prob)` 로 계산
+  - ROC 곡선은 `roc_curve`로 좌표를 얻어 matplotlib으로 시각화할 수 있습니다.
+
+재현성과 주의사항
+-----------------
+- 시드 고정: `numpy`, `tensorflow`의 시드를 고정해 실험 재현성을 높였습니다.
+- 본 코드는 **학습용/연습용**으로 정확도 최적화보다는 **실행 가능성·가독성**에 중점을 두었습니다.
+  실제 서비스/연구용에서는 별도의 검증 세트 확보, 교차검증, 하이퍼파라미터 탐색, 불균형 처리, 특성 선택/정규화 등의 개선이 필요합니다.
+
+필요 패키지(예시)
+-----------------
+- `pandas`, `numpy`, `scikit-learn`, `tensorflow>=2.x`, `matplotlib`
+
+요약
+----
+이 스크립트는 `titanic.csv`의 실제 컬럼과 형식(문자/숫자)에 맞춘 전처리와
+간단한 DNN 모델 학습 코드를 **줄 단위**로 제공하여 초심자도 흐름을 쉽게 따라갈 수 있도록 구성했습니다.
+현재 구현은 **테스트 세트를 검증에 사용하는 예시 구문**을 포함할 수 있으므로,
+엄밀한 평가를 원할 경우 **검증 세트 분리** 또는 `validation_split`을 활용하고
+**테스트 세트는 오직 최종 평가**에만 사용하시기 바랍니다.
+
+"""
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import random
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report
 from sklearn.metrics import roc_curve, roc_auc_score
 import tensorflow as tf
-import random
-import re  # For title extraction
+from tensorflow.keras import Sequential, Input                          # type:ignore
+from tensorflow.keras.layers import Dense, Dropout                      # type:ignore
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint   # type:ignore
+from imblearn.over_sampling import SMOTE
 
 random.seed(42)
 np.random.seed(42)
 tf.random.set_seed(42)
 
-### Load Data
+# ==== 1) 데이터 로드: seaborn 형식 titanic.csv ====
 df = pd.read_csv("./titanic.csv")
+# df.columns -> ['survived','pclass','sex','age','sibsp','parch','fare','embarked',
+#                'class','who','adult_male','deck','embark_town','alive','alone']
 
-"""
-Feature Engineering and Data Preprocessing Documentation
+# ==== 2) 타깃/누수 컬럼/중복 의미 컬럼 정리 ====
+# 타깃: survived
+# 누수(leakage): 'alive'는 survived를 문자로 표현 → 제거
+# 중복/대체가능: 'class'(텍스트)는 'pclass'(정수)와 중복 의미 → pclass만 사용
+cols_drop = ["alive", "class"]
+df = df.drop(columns=[c for c in cols_drop if c in df.columns])
 
-Overview:
-This section handles feature engineering and preprocessing for the Titanic dataset, which contains 891 rows and 12 columns (PassengerId, Survived, Pclass, Name, Sex, Age, SibSp, Parch, Ticket, Fare, Cabin, Embarked). The goal is to transform raw data into meaningful inputs for a DNN model to predict survival (binary classification: 0 = did not survive, 1 = survived). Feature engineering draws from domain knowledge of the 1912 Titanic disaster, where factors like social class, family ties, and cabin location influenced survival rates (e.g., women and children first, higher classes prioritized).
+# ==== 3) 기본 파생 컬럼: family_size, is_alone, fare_per_person ====
+df["family_size"] = df["sibsp"].fillna(0) + df["parch"].fillna(0) + 1
+# seaborn 데이터에는 'alone'이 bool로 존재 → 정수로 변환(모델 입력에 유리)
+df["is_alone"] = df["alone"].astype(int) if "alone" in df.columns else (df["family_size"] == 1).astype(int)
+# 0으로 나눗셈 방지
+df["fare_per_person"] = (df["fare"] / df["family_size"]).replace([np.inf, -np.inf], np.nan)
 
-Key Challenges Addressed:
-- Missing Values: Age (19.87% missing), Cabin (77.1% missing), Embarked (0.22% missing), Fare (minor). Imputation preserves data (~891 rows) instead of dropping, avoiding loss of ~80% of rows.
-- Class Imbalance: ~62% non-survivors vs. ~38% survivors; handled later via SMOTE.
-- Categorical to Numerical: One-hot encoding for model compatibility.
-- Outliers: Numerical features like Fare can skew; IQR removal post-imputation mitigates without excessive data loss.
-- Derived Features: Create new variables to capture hidden patterns, boosting model accuracy by 5-15% in benchmarks.
+# ==== 4) 결측치 처리 ====
+# 수치: age, fare, fare_per_person → 중앙값
+for c in ["age", "fare", "fare_per_person"]:
+    if c in df.columns:
+        df[c] = df[c].fillna(df[c].median())
 
-Defined Features:
-- Numerical: ['Age', 'Fare', 'SibSp', 'Parch', 'FamilySize', 'Title']
-- Categorical: ['Sex', 'Embarked', 'Pclass', 'Deck']
+# 범주: embarked, deck, who, embark_town → 최빈값/특정 라벨
+if "embarked" in df.columns:
+    df["embarked"] = df["embarked"].fillna(df["embarked"].mode().iloc[0])
+if "deck" in df.columns:
+    df["deck"] = df["deck"].fillna("M")  # 결측을 별도 카테고리로
+if "who" in df.columns:
+    df["who"] = df["who"].fillna(df["who"].mode().iloc[0])
+if "embark_town" in df.columns:
+    df["embark_town"] = df["embark_town"].fillna(df["embark_town"].mode().iloc[0])
 
-Step-by-Step Process:
+# ==== 5) 덱(갑판) 그룹핑(선택) ====
+# A/B/C → ABC, D/E → DE, F/G → FG, M(결측)
+if "deck" in df.columns:
+    df["deck"] = df["deck"].replace({"A":"ABC","B":"ABC","C":"ABC","D":"DE","E":"DE","F":"FG","G":"FG"})
 
-1. Extract 'Title' from Name:
-   - Uses regex to pull honorifics (e.g., Mr, Mrs).
-   - Groups rare titles (e.g., Lady, Col) into 'Rare' for sparsity reduction.
-   - Maps to numerical codes (Mr=1, Miss=2, etc.) for DNN input.
-   - Rationale: Titles proxy for age/gender/status; e.g., 'Master' (young boys) had ~58% survival vs. 'Mr' ~16%. This feature often improves accuracy by 2-5% in Kaggle models.
+# ==== 6) 사용 컬럼 선택(수치/범주) ====
+num_features = ["age", "fare", "sibsp", "parch", "family_size", "fare_per_person", "is_alone"]
+cat_features = ["sex", "embarked", "deck", "who", "pclass"]  # pclass를 범주로 더미화
 
-2. Create 'FamilySize' and 'IsAlone':
-   - FamilySize = SibSp + Parch + 1 (includes self).
-   - IsAlone = 1 if FamilySize == 1, else 0.
-   - Rationale: Mid-sized families (2-4 members) had ~50-72% survival due to mutual aid, vs. ~16% for large (>5) or ~30% for alone. Combines correlated SibSp/Parch, reducing multicollinearity.
+# bool → int (adult_male, alone는 이미 처리 or 제거됨)
+if "adult_male" in df.columns:
+    df["adult_male"] = df["adult_male"].astype(int)
+    num_features.append("adult_male")
 
-3. Extract 'Deck' from Cabin:
-   - Takes first letter (A-G) or 'M' for missing.
-   - Groups into 'ABC' (upper), 'DE' (mid), 'FG' (lower), 'M' (missing/unknown).
-   - Rationale: Upper decks (A-C) closer to lifeboats (~47% survival) vs. lower (~24%). Handles high missingness by treating 'M' as a category, avoiding bias.
-
-4. Imputation for Missing Values:
-   - Age and Fare: Median (robust to outliers; Age ~28-29, Fare ~14-15).
-   - Embarked: Mode 'S' (most common port).
-   - Rationale: Median prevents outlier influence (e.g., high fares). 'S' for Embarked as ~72% boarded there; minor impact but 'C' had slightly higher survival (~55%).
-
-5. Drop Irrelevant Columns:
-   - Name, Ticket, Cabin (post-extraction), PassengerId: No predictive value or redundant.
-
-6. One-Hot Encoding:
-   - For categorical features (Sex, Embarked, Pclass, Deck).
-   - drop_first=True to avoid dummy trap.
-   - Rationale: DNNs require numerical inputs; e.g., Sex_male (females ~74% survival vs. males ~19%), Pclass_3 (~24% survival vs. 1st ~63%).
-
-7. Outlier Removal:
-   - IQR method (1.5 * IQR bounds) per numerical feature.
-   - Applied after imputation but before split to identify global outliers, though post-split scaling prevents leakage.
-   - Rationale: Removes extremes (e.g., Fare >500, rare but valid; caps at ~3-5% data loss). In Titanic, high fares correlate with survival but extremes can distort scaling.
-
-Post-Processing:
-- Results in ~15-20 features (post-dummies).
-- Train-test split (80/20), then RobustScaler (median/IQR-based, outlier-resistant).
-- Benefits: Enhanced model performance (Kaggle benchmarks: 78-82% accuracy with these features vs. 70-75% baseline).
-
-Sources for Rationale:
-- Kaggle Titanic tutorials emphasize Title, FamilySize, Deck for top scores.
-- Survival stats from EDA: e.g., Seaborn visualizations show clear correlations.
-"""
-
-### Feature Engineering and Data Preprocessing
-# Define features
-num_features = ['Age', 'Fare', 'SibSp', 'Parch']
-cat_features = ['Sex', 'Embarked', 'Pclass']
-
-# Extract Title from Name
-df['Title'] = df['Name'].apply(lambda x: re.search(' ([A-Za-z]+)\.', x).group(1))
-df['Title'] = df['Title'].replace(['Lady', 'Countess', 'Capt', 'Col', 'Don', 'Dr', 'Major', 'Rev', 'Sir', 'Jonkheer', 'Dona'], 'Rare')
-df['Title'] = df['Title'].replace('Mlle', 'Miss')
-df['Title'] = df['Title'].replace('Ms', 'Miss')
-df['Title'] = df['Title'].replace('Mme', 'Mrs')
-title_mapping = {"Mr": 1, "Miss": 2, "Mrs": 3, "Master": 4, "Rare": 5}
-df['Title'] = df['Title'].map(title_mapping)
-df['Title'] = df['Title'].fillna(0)
-num_features.append('Title')  # Add to numerical
-
-# Create FamilySize and IsAlone
-df['FamilySize'] = df['SibSp'] + df['Parch'] + 1
-df['IsAlone'] = 1
-df['IsAlone'].loc[df['FamilySize'] > 1] = 0
-num_features.append('FamilySize')  # Add to numerical
-
-# Extract Deck from Cabin
-df['Deck'] = df['Cabin'].apply(lambda s: s[0] if pd.notnull(s) else 'M')
-df['Deck'] = df['Deck'].replace(['A', 'B', 'C', 'T'], 'ABC')
-df['Deck'] = df['Deck'].replace(['D', 'E'], 'DE')
-df['Deck'] = df['Deck'].replace(['F', 'G'], 'FG')
-cat_features.append('Deck')  # Add to categorical
-
-# Handle missing values (imputation instead of dropna)
-df['Age'] = df['Age'].fillna(df['Age'].median())
-df['Fare'] = df['Fare'].fillna(df['Fare'].median())
-df['Embarked'] = df['Embarked'].fillna('S')
-
-# Drop irrelevant columns
-df = df.drop(['Name', 'Ticket', 'Cabin', 'PassengerId'], axis=1)
-
-# One-hot encode categorical features
-df = pd.get_dummies(df, columns=cat_features, drop_first=True)
+# 실제 존재하는 컬럼만 사용하도록 필터링
+num_features = [c for c in num_features if c in df.columns]
+cat_features = [c for c in cat_features if c in df.columns]
+df_model = df[num_features + cat_features + ["survived"]].copy()
 
 # Outlier removal on numerical features
-for feature in num_features:
-    if feature in df.columns:  # Check existence
-        Q1 = df[feature].quantile(0.25)
-        Q3 = df[feature].quantile(0.75)
-        IQR = Q3 - Q1
-        lower_bound = Q1 - 1.5 * IQR
-        upper_bound = Q3 + 1.5 * IQR
-        df = df[(df[feature] >= lower_bound) & (df[feature] <= upper_bound)]
+for ft in num_features:
+   if ft in df_model.columns:  # Check existence
+      Q1 = df_model[ft].quantile(0.25)
+      Q3 = df_model[ft].quantile(0.75)
+      IQR = Q3 - Q1
+      lower_bound = Q1 - 1.5 * IQR
+      upper_bound = Q3 + 1.5 * IQR
+      df_model = df_model[(df_model[ft] >= lower_bound) & (df_model[ft] <= upper_bound)]
 
-# Separate target and features
-y = df.pop('Survived')
-X = df
+# ==== 7) 원-핫 인코딩 ====
+df_model = pd.get_dummies(df_model, columns=cat_features, drop_first=True)
 
-# Split dataset
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=0)
+# ==== 8) 입력/타깃 분리 ====
+y = df_model.pop("survived").astype(int).values
+X = df_model.values
+feature_names = df_model.columns.tolist()
 
-# Scale after split
+# ==== 9) 학습/평가 분할 ====
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+# ==== 10) 스케일링 ====
 scaler = RobustScaler()
 X_train = scaler.fit_transform(X_train)
-X_test = scaler.transform(X_test)
+X_test  = scaler.transform(X_test)
+
 
 ### Build DNN Model
-from tensorflow.python.keras.models import Sequential
-from tensorflow.python.keras.layers import Dense, Dropout
-from tensorflow.python.keras import Input    # 시험에서는 안씀.
-
-# 모델 생성
 model = Sequential()
 
-# 모델 구성
-model.add(Input(X_train.shape[1],))    # Warning 메시지 제거
-model.add(Dense(32, activation='relu'))
-# AICE 시험에서는
-# - model.add(Input(X_train.shape[1],))
-# + model.add(Dense(32, activation='relu', input_shape(X_train.shape[1],)))
+model.add(Dense(32, activation='relu', input_shape=(X_train.shape[1],)))
 model.add(Dense(16, activation='relu'))
 model.add(Dropout(rate=0.2))
 model.add(Dense(16, activation='relu'))
@@ -184,8 +222,6 @@ model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy']
 # precision, recall, f1_score: 클래스 불균형이나 특정 클래스(양성)에 초점을 맞출 때 유용
 # auc: 클래스 분리 능력을 평가
 
-from tensorflow.python.keras.callbacks import EarlyStopping, ModelCheckpoint
-
 es = EarlyStopping(monitor='val_loss', patience=5, verbose=1)
 mc = ModelCheckpoint('best_model.h5', monitor='val_loss', save_best_only=True, verbose=1)
 
@@ -210,7 +246,7 @@ y_pred = (model.predict(X_test) > 0.5).astype(int)
 # np.argmax : 행(axis = 0) 또는 열(axis = 1)을 따라 가장 큰 값의 index 반환
 
 # Metrics
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report
+
 print("Accuracy:", accuracy_score(y_test, y_pred))
 print("Precision:", precision_score(y_test, y_pred))
 print("Recall:", recall_score(y_test, y_pred))
@@ -248,8 +284,9 @@ def plot_training_history(history):
 
 def plot_roc_curve(y_test, y_pred_proba_pos):
    fpr, tpr, thresholds = roc_curve(y_test, y_pred_proba_pos)
+   auc_score = roc_auc_score(y_test, y_pred_proba_pos)  # ← 추가
    plt.plot(fpr, tpr, label=f'ROC curve (AUC = {auc_score:.2f})')
-   plt.plot([0, 1], [0, 1], 'k--', label='Classifier') # Diagonal line
+   plt.plot([0, 1], [0, 1], 'k--', label='Classifier')
    plt.xlabel('False Positive Rate')
    plt.ylabel('True Positive Rate')
    plt.title('Receiver Operating Characteristic (ROC) Curve')
@@ -259,16 +296,29 @@ def plot_roc_curve(y_test, y_pred_proba_pos):
 plot_training_history(history)
 
 # plot ROC curve
-plot_roc_curve(y_test, model.predict_proba(X_test)[:,1])
+y_prob = model.predict(X_test).ravel()
+plot_roc_curve(y_test, y_prob)
+"""
+scikit-learn 추정기(분류기)에는 관례적으로 predict_proba가 있다.
+tf.keras 모델은 model.predict가 “마지막 층의 출력값”을 그대로 반환한다.
+
+마지막 층이 sigmoid(이진 분류)면 predict 결과가 곧 양성 확률.
+마지막 층이 softmax(다중 분류)면 predict 결과가 각 클래스 확률 분포(합=1.0).
+
+ravel()은 모양(차원)을 (N,1) → (N,)으로 펴 주는 것뿐입니다.
+이진 분류에서 predict가 (샘플수, 1) 형태로 나오므로,
+y_prob = model.predict(X_test).ravel()로 1차원 벡터로 바꿔
+roc_auc_score, roc_curve 같은 sklearn 지표에 맞춥니다.
+
+"""
 
 # print AUC score
-auc_score = roc_auc_score(y_test, model.predict_proba(X_test)[:,1])
+auc_score = roc_auc_score(y_test, y_prob)
 print(f"AUC Score: {auc_score:.2f}")
 
 
 ###### 모델 성능 점수 향상을 위한 새로운 모델 작성 ######
 ### Imbalance Handling with SMOTE
-from imblearn.over_sampling import SMOTE
 smote = SMOTE(random_state=0)
 X_train_ovr, y_train_ovr = smote.fit_resample(X_train, y_train)
 
@@ -282,8 +332,7 @@ print(pd.Series(y_train_ovr).value_counts())
 model_smote = Sequential()
 
 # 모델 구성
-model_smote.add(Input(X_train.shape[1],))
-model_smote.add(Dense(32, activation='relu'))
+model_smote.add(Dense(32, activation='relu', input_shape=(X_train_ovr.shape[1],)))
 model_smote.add(Dense(16, activation='relu'))
 model_smote.add(Dropout(rate=0.2))
 model_smote.add(Dense(16, activation='relu'))
@@ -307,8 +356,6 @@ history_smote = model_smote.fit(
     verbose=0
 )
 
-plot_training_history(history_smote)
-
 # Prediction (for sigmoid)
 y_pred_smote = (model_smote.predict(X_test) > 0.5).astype(int)
 
@@ -318,28 +365,12 @@ print("Recall:", recall_score(y_test, y_pred_smote))
 print("F1 Score:", f1_score(y_test, y_pred_smote))
 print("Classification Report", classification_report(y_test, y_pred_smote))
 
+plot_training_history(history_smote)
 
-'''
-NOTES
+# plot ROC curve
+y_prob_sm = model_smote.predict(X_test).ravel()
+plot_roc_curve(y_test, y_prob_sm)
 
-The Titanic dataset, a staple in machine learning tutorials, requires careful feature engineering and preprocessing to transform its raw attributes into predictive signals for survival prediction using a deep neural network (DNN). This process addresses data quality issues like missing values and creates derived features based on historical context—such as the "women and children first" protocol and class-based lifeboat access during the 1912 disaster. The added docstring encapsulates this in detail, serving as an in-code reference that explains each step, its rationale, and expected impacts on model accuracy (typically boosting from baseline 70-75% to 78-82% on Kaggle leaderboards).
-Detailed Breakdown of Feature Engineering
-Feature engineering involves creating new variables or transforming existing ones to better capture underlying patterns. In the Titanic context, this leverages exploratory data analysis (EDA) insights, such as correlations from Seaborn visualizations or crosstabs showing survival disparities. For instance:
-
-Title Extraction: Regex pulls honorifics from the 'Name' column, grouping rares like 'Col' or 'Dr' into 'Rare' to handle sparsity (only ~5% of titles are rare). Mapping to integers (1-5) treats it as ordinal, reflecting social hierarchy—'Mrs' and 'Miss' had ~70-79% survival due to gender priorities, while 'Mr' ~16%. This feature often ranks high in importance via techniques like permutation importance in tree models.
-FamilySize and IsAlone: Derived from 'SibSp' (siblings/spouses) and 'Parch' (parents/children), FamilySize aggregates total onboard family, with IsAlone flagging solos. EDA reveals a U-shaped survival curve: size 1 (~30% survival), 2-4 (~50-72%), >4 (~16%), as larger groups faced coordination issues but small ones aided each other. This reduces feature redundancy (SibSp and Parch correlate ~0.4) and enhances interpretability.
-Deck Grouping: From 'Cabin', extract the deck letter and bin into levels (ABC upper, DE mid, FG lower, M missing). Missing cabins (77%) are treated as 'M' to avoid bias, as they often correlate with lower classes. Upper decks had ~47% survival due to proximity to boats, vs. ~24% lower— a proxy for socioeconomic status beyond Pclass.
-
-These steps expand the feature set to ~15-20 post-encoding, providing the DNN with richer inputs without excessive dimensionality.
-Detailed Breakdown of Data Preprocessing
-Preprocessing ensures data is clean, scaled, and model-ready, mitigating issues like skewness or leakage.
-
-Imputation Strategies: Median for Age (~29) and Fare (~14.45) is outlier-resistant (vs. mean, skewed by high values like Fare max 512). Embarked uses mode 'S' (~72% of data), with minor impact but 'C' ports showing ~55% survival possibly due to wealthier passengers. This retains all 891 rows, crucial for small datasets where dropping NaNs loses ~80%.
-Dropping Columns: 'Name', 'Ticket', 'Cabin' (post-extraction), 'PassengerId' are irrelevant—Ticket has no pattern, PassengerId is an index.
-One-Hot Encoding: Converts categoricals (e.g., Sex to Sex_male) with drop_first to prevent multicollinearity. Pclass_3 encodes lower class (~24% survival), Embarked_S/Q reflect ports (~39% for S).
-Outlier Removal: IQR (Q1 - 1.5IQR to Q3 + 1.5IQR) per numerical feature removes ~3-5% extremes (e.g., Age >65 rare, Fare >100 high). Applied globally but scaling post-split avoids leakage; in Titanic, this smooths distributions without losing key signals.
-Splitting and Scaling: 80/20 train-test split with seed for reproducibility. RobustScaler (median/IQR) handles remaining outliers better than StandardScaler.
-
-Impact on Model Performance
-These techniques align with top Kaggle solutions, where feature engineering contributes more to gains than hyperparameter tuning. For DNNs, they provide non-linear interactions (e.g., Title + Age for child identification). SMOTE later addresses imbalance, improving recall for survivors. Potential pitfalls: Over-grouping Deck may lose granularity, but it handles missingness effectively.
-'''
+# print AUC score
+auc_score = roc_auc_score(y_test, y_prob_sm)
+print(f"AUC Score: {auc_score:.2f}")

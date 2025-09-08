@@ -5,6 +5,7 @@ output_*/
 *.csv
 *.png
 *.txt
+*.h5
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
