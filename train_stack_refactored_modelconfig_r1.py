@@ -1,6 +1,4 @@
 """
-train_stack_refactored.py — DOCSTRING
-
 Purpose
 - Train target-wise stacking regressors with scikit-learn’s StackingRegressor.
 - Keep API compatibility with existing FastAPI service by persisting the same bundle schema.
@@ -126,6 +124,10 @@ from sklearnex import patch_sklearn
 patch_sklearn()
 import optuna
 from optuna.pruners import MedianPruner
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 
 pd.set_option("display.max_columns", None)
 pd.set_option("display.width", 200)
@@ -145,14 +147,14 @@ RANDOM_STATE = 42
 CV_FOLDS     = 5  # 교차 검증 폴드 수
 
 # --- Optuna 하이퍼파라미터 탐색 제어 ---
-USE_OPTUNA = True # True: Optuna 탐색 실행 | False: 저장된 파라미터 사용
+USE_OPTUNA = False # True: Optuna 탐색 실행 | False: 저장된 파라미터 사용
 N_TRIALS   = 30   # Optuna 탐색 횟수
 USE_PRUNING = True  # 폴드 단위 중간 결과 기반 프루닝 사용 여부
 # KFold 기반 중간 보고 프루너. warmup 폴드(=n_warmup_steps) 이후부터 비교 시작
 PRUNER = MedianPruner(n_startup_trials=5, n_warmup_steps=2, interval_steps=1)
 
 # --- 실험/모델 구성 설정 ---
-TEST_ID = 3
+TEST_ID = 1
 # 각 TEST_ID별 모델 조합과 하이퍼파라미터 탐색 공간 정의
 # - 새로운 모델 조합을 쉽게 추가/변경할 수 있도록 딕셔너리 구조 사용
 
@@ -302,6 +304,8 @@ output_dir = Path('./output')
 output_dir.mkdir(exist_ok=True)
 input_dir = Path('./input')
 input_dir.mkdir(exist_ok=True)
+fig_dir = output_dir / f"figures_{TEST_ID}"
+fig_dir.mkdir(exist_ok=True)
 # =============================================================================
 
 
@@ -455,6 +459,65 @@ def make_stacking_pipeline(X: pd.DataFrame, params: Dict[str, Any]) -> Pipeline:
     return Pipeline([("preprocessor", preprocessor), ("stacking_regressor", stacking_regressor)])
 
 
+def _save_fig(fig: plt.Figure, filename: str):
+    """공통 저장 헬퍼: 여백 정리 후 저장 및 자원 해제."""
+    fig.tight_layout()
+    # 파일명에 TEST_ID 강제 포함
+    stem = f"{TEST_ID}__{filename}"
+    fig.savefig(fig_dir / f"{stem}.png", dpi=200)
+    plt.close(fig)
+
+
+def save_regression_plots(tgt: str, y_true: np.ndarray, y_pred: np.ndarray, dataset: str):
+    """타겟별 회귀 진단 플롯(Train/Test)을 저장한다."""
+    # 1) Pred vs Actual (Parity)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.scatter(y_true, y_pred, s=18, alpha=0.6, edgecolors='none')
+    min_v = float(np.min([y_true.min(), y_pred.min()]))
+    max_v = float(np.max([y_true.max(), y_pred.max()]))
+    ax.plot([min_v, max_v], [min_v, max_v], linestyle="--")
+    ax.set_xlabel("Actual")
+    ax.set_ylabel("Predicted")
+    ax.set_title(f"{tgt} • {dataset.upper()} • Pred vs Actual")
+    _save_fig(fig, f"{tgt}__pred_vs_actual__{dataset}")
+
+    # 2) Residuals vs Fitted
+    residuals = y_true - y_pred
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.scatter(y_pred, residuals, s=18, alpha=0.6, edgecolors='none')
+    ax.axhline(0.0, linestyle="--")
+    ax.set_xlabel("Fitted (Predicted)")
+    ax.set_ylabel("Residuals (y - ŷ)")
+    ax.set_title(f"{tgt} • {dataset.upper()} • Residuals vs Fitted")
+    _save_fig(fig, f"{tgt}__residuals_vs_fitted__{dataset}")
+
+    # 3) Residual Histogram
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.hist(residuals, bins=30, density=False)
+    ax.set_xlabel("Residuals")
+    ax.set_ylabel("Count")
+    ax.set_title(f"{tgt} • {dataset.upper()} • Residual Histogram")
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=8))
+    _save_fig(fig, f"{tgt}__residual_hist__{dataset}")
+
+
+def save_aggregate_metric_plots(report_df: pd.DataFrame):
+    """테스트셋 기준 타겟별 MAE/RMSE/R2 막대 그래프 저장."""
+    te = report_df[report_df["dataset"] == "test"].copy()
+    te = te.sort_values("target")
+    metrics = ["MAE", "RMSE", "R2"]
+    for m in metrics:
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        ax.bar(te["target"], te[m])
+        ax.set_xlabel("Target")
+        ax.set_ylabel(m)
+        ax.set_title(f"Test {m} by Target")
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=6))
+        for i, v in enumerate(te[m].values):
+            ax.text(i, v, f"{v:.3f}", ha="center", va="bottom", fontsize=9)
+        _save_fig(fig, f"metrics_{m.lower()}")
+
+
 def optuna_objective(trial: optuna.Trial, X_df: pd.DataFrame, y: np.ndarray) -> float:
     """Optuna 탐색을 위한 목적 함수."""
     params: Dict[str, Any] = {}
@@ -523,7 +586,7 @@ def generate_and_save_reports(
     df_tr: pd.DataFrame,
     df_te: pd.DataFrame
 ):
-    """학습된 모델들의 학습/테스트 성능을 평가하고 CSV 파일로 저장합니다."""
+    """학습된 모델들의 학습/테스트 성능을 평가하고 CSV, 그림 파일로 저장합니다."""
     report_rows = []
     print("\n--- Final Model Performance Report ---")
     
@@ -538,6 +601,7 @@ def generate_and_save_reports(
         train_metrics['target'] = tgt
         train_metrics['dataset'] = 'train'
         report_rows.append(train_metrics)
+        save_regression_plots(tgt, y_tr, y_tr_pred, dataset="train")
         
         # Test set 성능
         y_te_pred = model.predict(X_te)
@@ -545,6 +609,7 @@ def generate_and_save_reports(
         test_metrics['target'] = tgt
         test_metrics['dataset'] = 'test'
         report_rows.append(test_metrics)
+        save_regression_plots(tgt, y_te, y_te_pred, dataset="test")
 
         print(f"[{tgt:^10s}] Train | MAE={train_metrics['MAE']:.6f}, RMSE={train_metrics['RMSE']:.6f}, R2={train_metrics['R2']:.6f}")
         print(f"[{tgt:^10s}] Test  | MAE={test_metrics['MAE']:.6f}, RMSE={test_metrics['RMSE']:.6f}, R2={test_metrics['R2']:.6f}")
@@ -553,6 +618,9 @@ def generate_and_save_reports(
     report_df = pd.DataFrame(report_rows)[['target', 'dataset', 'MAE', 'RMSE', 'R2']]
     report_df.to_csv(output_dir / OUT_SCORES, encoding='utf-8-sig', index=False)
     print(f"\n[OK] Performance scores saved to: {OUT_SCORES}")
+
+    # 테스트 데이터 기준 결과 출력
+    save_aggregate_metric_plots(report_df)
 
 
 def main():
