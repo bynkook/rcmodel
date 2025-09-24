@@ -246,51 +246,11 @@ def plot_roc_curve(y_test, y_pred_proba_pos):
    plt.legend(loc='lower right')
    plt.show()
 
-import shap
-def perform_shap_analysis(model, X_test, feature_names):
-    """
-    Performs SHAP analysis to explain model predictions.
-
-    Args:
-        model (tensorflow.keras.Model): The trained Keras model.
-        X_test (np.array): The test data.
-        feature_names (list): A list of feature names corresponding to X_test columns.
-    
-    Example usage:
-        Before calling the function, make sure you have the feature names
-        feature_names = X.columns.tolist()
-        perform_shap_analysis(model, X_test, feature_names)
-    """
-    # Create a SHAP explainer
-    explainer = shap.KernelExplainer(model.predict, X_test)
-    
-    # Calculate SHAP values for the test data
-    shap_values = explainer.shap_values(X_test)
-    
-    # Summary plot of SHAP values
-    print("Generating SHAP summary plot...")
-    shap.summary_plot(shap_values, X_test, feature_names=feature_names)
-    
-    # Waterfall plot for a single instance (e.g., the first instance)
-    # https://shap.readthedocs.io/en/latest/example_notebooks/api_examples/plots/waterfall.html
-    print("Generating SHAP waterfall plot for the first instance...")
-    shap.waterfall_plot(shap.Explanation(
-        values=shap_values[0][0], 
-        base_values=explainer.expected_value[0], 
-        data=X_test[0], 
-        feature_names=feature_names
-    ))
-
-
 plot_training_history(history)
 
 # plot ROC curve
 y_prob = model.predict(X_test).ravel()
 plot_roc_curve(y_test, y_prob)
-
-# SHAP analysis
-# perform_shap_analysis(model, X_test, feature_names)
-
 """
 scikit-learn 추정기(분류기)에는 관례적으로 predict_proba가 있다.
 tf.keras 모델은 model.predict가 “마지막 층의 출력값”을 그대로 반환한다.
