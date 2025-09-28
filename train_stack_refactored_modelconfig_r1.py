@@ -159,10 +159,10 @@ TEST_ID = 1
 # - 새로운 모델 조합을 쉽게 추가/변경할 수 있도록 딕셔너리 구조 사용
 
 MODEL_CONFIGS = {
-    # 1) Baseline: RF + GBR → Ridge(meta), passthrough=False
+    # 1) Baseline: RF + GBR → Ridge(meta)
     1: {
         "desc": "RF + GBR -> Ridge (baseline)",
-        "stack_kwargs": {"passthrough": False},  # StackingRegressor 옵션
+        "stack_kwargs": {"passthrough": True},  # StackingRegressor 옵션
         "base_models": [
             ("rf",  "RandomForestRegressor", {"random_state": RANDOM_STATE, "n_jobs": -1}),
             ("gbr", "GradientBoostingRegressor", {"random_state": RANDOM_STATE}),
@@ -182,7 +182,7 @@ MODEL_CONFIGS = {
     # 2) HGBR + ExtraTrees → Ridge(meta), 다양성↑
     2: {
         "desc": "HGBR + ExtraTrees -> Ridge",
-        "stack_kwargs": {"passthrough": False},
+        "stack_kwargs": {"passthrough": True},
         "base_models": [
             ("hgbr", "HistGradientBoostingRegressor", {"random_state": RANDOM_STATE}),
             ("etr",  "ExtraTreesRegressor", {"random_state": RANDOM_STATE, "n_jobs": -1}),
@@ -198,9 +198,9 @@ MODEL_CONFIGS = {
         },
     },
 
-    # 3) LightGBM + ExtraTrees → ElasticNet(meta), passthrough=True
+    # 3) LightGBM + ExtraTrees → ElasticNet(meta)
     3: {
-        "desc": "LightGBM + ExtraTrees -> ElasticNet (passthrough=True) [requires lightgbm]",
+        "desc": "LightGBM + ExtraTrees -> ElasticNet",
         "stack_kwargs": {"passthrough": True},
         "base_models": [
             ("lgbm", "LGBMRegressor", {"random_state": RANDOM_STATE, "n_jobs": -1, "verbose": -1}),
@@ -219,16 +219,16 @@ MODEL_CONFIGS = {
         },
     },
 
-    # 4) CatBoost + Ridge(meta), passthrough=True
+    # 4) CatBoost + Ridge(meta) /// not working
     4: {
-        "desc": "CatBoost -> Ridge (passthrough=True) [requires catboost]",
-        "stack_kwargs": {"passthrough": True},
+        "desc": "CatBoost -> Ridge",
+        "stack_kwargs": {"passthrough": False},
         "base_models": [
             ("cbr", "CatBoostRegressor", {"random_seed": RANDOM_STATE, "verbose": 0}),
         ],
         "final_model": ("ridge", "Ridge", {}),
         "param_space": {
-            "cbr_depth":             ("int",    3,    20),
+            "cbr_depth":             ("int",    3,    16),
             "cbr_learning_rate":     ("float", 1e-3, 1.0, "log"),
             "cbr_l2_leaf_reg":       ("float", 1.0,   10),
             "cbr_iterations":        ("int",   300, 1200, 100),
@@ -239,7 +239,7 @@ MODEL_CONFIGS = {
     # 5) 이종 GBMs: HGBR(얕음, 큰 lr) + GBR(깊음, 작은 lr) → ElasticNet(meta)
     5: {
         "desc": "HGBR(shallow, high-lr) + GBR(deeper, low-lr) -> ElasticNet",
-        "stack_kwargs": {"passthrough": False},
+        "stack_kwargs": {"passthrough": True},
         "base_models": [
             ("hgbr", "HistGradientBoostingRegressor", {"random_state": RANDOM_STATE}),
             ("gbr",  "GradientBoostingRegressor", {"random_state": RANDOM_STATE}),
@@ -257,9 +257,9 @@ MODEL_CONFIGS = {
         },
     },
 
-    # 6) RF + ExtraTrees → Ridge(meta), passthrough=True
+    # 6) RF + ExtraTrees → Ridge(meta)
     6: {
-        "desc": "RF + ExtraTrees -> Ridge (passthrough=True)",
+        "desc": "RF + ExtraTrees -> Ridge",
         "stack_kwargs": {"passthrough": True},
         "base_models": [
             ("rf",  "RandomForestRegressor", {"random_state": RANDOM_STATE, "n_jobs": -1}),
@@ -689,3 +689,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
